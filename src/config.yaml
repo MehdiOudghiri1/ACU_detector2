@@ -1,0 +1,18 @@
+# config.yaml — defaults & policy (edit without changing code)
+
+aliases:
+  gas: GasHeater      # typing "gas" then Enter starts a Gas Heater component
+  ec: ECM             # typing "ec" then Enter starts EC Fans (ECM)
+
+export:
+  filename_template: "{tag}_p{page}.json"  # tokens: {tag} from file name or meta, {page} is 1-based
+  pretty: true
+
+autosave:
+  enabled: true
+  seconds: 30         # every 30s, write an autosave JSON if state is dirty and valid
+  dir: ".acu_autosave"
+
+pdf:
+  cache_pages: 12     # LRU capacity for rendered pages
+  workers: 2          # background prefetch threads

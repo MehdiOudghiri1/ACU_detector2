@@ -1,0 +1,55 @@
+from textwrap import dedent
+from registry import PluginRegistry
+
+
+def test_plugin_load_adds_new_component(tmp_path):
+    # Create plugin YAML defining a new simple component
+    (tmp_path / "custom.yaml").write_text(dedent("""
+        type_id: CustomPart
+        label: Custom Part
+        type_key: CustomPart
+        field_sequence: [ mode ]
+        required_fields: [ mode ]
+        fields:
+          mode:
+            type: enum
+            map:
+              a: Auto
+              m: Manual
+        aliases: [ custom, cp ]
+    """), encoding="utf-8")
+
+    reg = PluginRegistry(plugins_dir=tmp_path)
+
+    assert reg.resolve_token("custom") == "CustomPart"
+    spec = reg.get_spec("CustomPart")
+    assert spec["label"] == "Custom Part"
+
+    ok, val, err = reg.validate_value("CustomPart", "mode", "a")
+    assert ok and val == "Auto"
+
+
+def test_plugin_overrides_builtin(tmp_path):
+    # Override Filters mapping to add 'x' -> 'Panel'
+    (tmp_path / "filters_override.yaml").write_text(dedent("""
+        type_id: Filters
+        field_sequence: [ type ]
+        required_fields: [ type ]
+        fields:
+          type:
+            type: enum
+            map:
+              p: Panel
+              panel: Panel
+              c: Combo
+              combo: Combo
+              a: Angled
+              angled: Angled
+              x: Panel
+        aliases: [ filter, filters ]
+    """), encoding="utf-8")
+
+    reg = PluginRegistry(plugins_dir=tmp_path)
+
+    ok, val, err = reg.validate_value("Filters", "type", "x")
+    assert ok and val == "Panel"

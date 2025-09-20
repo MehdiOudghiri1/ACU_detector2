@@ -67,3 +67,12 @@ class AppState:
             if s.id == self.active_section_id:
                 return s
         return None
+
+@dataclass
+class EditingDraft:
+    type_id: str
+    label: str
+    field_sequence: list[str]        # current, filtered sequence shown to the user
+    index: int
+    values: dict[str, Any]
+    base_field_sequence: list[str]   # NEW: original, full sequence from spec

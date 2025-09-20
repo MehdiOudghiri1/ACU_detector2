@@ -13,11 +13,10 @@ from registry import PluginRegistry
 from state import (
     Store, Mode,
     NewSection, StartComponent, SetFieldValue, NextField, PrevField,
-    CancelDraft, NavPage, SetZoom, MarkSaved,
+    CancelDraft, NavPage, SetZoom, MarkSaved, SetSectionLength, ResetSection
 )
 from pdfio import PdfIO
 from dimension_extractor import analyze_page
-
 
 
 # -------------------------
@@ -34,7 +33,7 @@ class Action:
     TOKEN_APPEND = "TOKEN_APPEND"
     TOKEN_SUBMIT = "TOKEN_SUBMIT"
     TOKEN_CLEAR = "TOKEN_CLEAR"
-    SET_FIELD_VALUE = "SET_FIELD_VALUE"  # kept for backward-compat (not used by type-ahead)
+    SET_FIELD_VALUE = "SET_FIELD_VALUE"
     NEXT_FIELD = "NEXT_FIELD"
     PREV_FIELD = "PREV_FIELD"
     CANCEL_DRAFT = "CANCEL_DRAFT"
@@ -54,10 +53,10 @@ class Action:
     FIELDBUF_CLEAR = "FIELDBUF_CLEAR"
     NEXT_PDF = "NEXT_PDF"
 
+    # Resets (standardized)
+    RESET_SECTION = "RESET_SECTION"     # Ctrl+R → reset active section (incl. length) and prompt length again
+    START_OVER = "START_OVER"           # Ctrl+Shift+R → clear all annotations for this PDF
 
-# -------------------------
-# KeyRouter (mode-aware)
-# -------------------------
 
 # -------------------------
 # KeyRouter (mode-aware)
@@ -73,6 +72,13 @@ class KeyRouter:
 
         # --- Global shortcuts (always) ---
         if mods & QtCore.Qt.ControlModifier:
+            # Reset section only: Ctrl+R
+            if key == QtCore.Qt.Key_R and not (mods & QtCore.Qt.ShiftModifier):
+                return Action(Action.RESET_SECTION)
+            # Start over (entire PDF): Ctrl+Shift+R
+            if key == QtCore.Qt.Key_R and (mods & QtCore.Qt.ShiftModifier):
+                return Action(Action.START_OVER)
+
             if key in (QtCore.Qt.Key_O,):
                 return Action(Action.OPEN_PDF)
             if key in (QtCore.Qt.Key_S,):
@@ -141,7 +147,6 @@ class KeyRouter:
                 return Action(Action.TOKEN_APPEND, ch)
 
         return Action(Action.NOOP)
-
 
 
 # -------------------------
@@ -260,7 +265,7 @@ class PromptBuilder:
         pc = max(1, state.pdf.page_count) if state.pdf else 1
         pg = (state.pdf.page + 1) if state.pdf else 1
         zoom = int((state.pdf.zoom if state.pdf else 1.0) * 100)
-        foot = f"Page {pg}/{pc}  •  Zoom {zoom}%  •  Ctrl+O to open PDF"
+        foot = f"Page {pg}/{pc}  •  Zoom {zoom}%  •  Ctrl+R reset section • Ctrl+Shift+R start over • Ctrl+O open"
 
         return HudModel(
             title=title,
@@ -441,7 +446,7 @@ class PdfCanvas(QtWidgets.QWidget):
         # Make it fill available space
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self._dim_rects_pt: list[tuple[float, float, float, float]] = []  # PDF-pt rects
-
+        self._dim_kinds: list[str] = []   # kinds for each rect
 
     def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
         super().resizeEvent(e)
@@ -468,19 +473,25 @@ class PdfCanvas(QtWidgets.QWidget):
         y = 8
         painter.drawImage(QtCore.QRect(x, y, iw, ih), img)
 
-                # --- overlays: dimension boxes ---
+        # --- overlays: dimension boxes ---
         if self._dim_rects_pt:
-            pen = QtGui.QPen(QtGui.QColor(255, 80, 0))  # orange
-            pen.setWidthF(2.0)
-            painter.setPen(pen)
-            painter.setBrush(QtCore.Qt.NoBrush)
+            def color_for_kind(k: str) -> QtGui.QColor:
+                if k == "cabinet_height":    return QtGui.QColor(160, 90, 200)  # purple (light)
+                if k == "height_base_only":  return QtGui.QColor(120, 40, 160)  # purple (dark)
+                if k == "width_with_base":   return QtGui.QColor( 70,130, 220)  # blue (light)
+                if k == "cabinet_width":     return QtGui.QColor( 30, 80, 180)  # blue (dark)
+                return QtGui.QColor(255, 80, 0)  # fallback
 
-            # map PDF-pt rects to logical image coords, then offset by where we drew the image (x,y)
-            for rect_pt in self._dim_rects_pt:
+            for i, rect_pt in enumerate(self._dim_rects_pt):
+                kind = self._dim_kinds[i] if i < len(self._dim_kinds) else ""
+                pen = QtGui.QPen(color_for_kind(kind))
+                pen.setWidthF(2.0)
+                painter.setPen(pen)
+                painter.setBrush(QtCore.Qt.NoBrush)
+
                 r = self.pdf.rect_pdfpt_to_qrectf(rect_pt, img)
-                r.translate(x, y)  # shift into the place where the image was drawn
+                r.translate(x, y)
                 painter.drawRect(r)
-
 
     def refit(self):
         """Recompute fit-to-frame for the current page at current DPR."""
@@ -496,11 +507,18 @@ class PdfCanvas(QtWidgets.QWidget):
         p.setPen(pen)
         p.drawText(rect, QtCore.Qt.AlignCenter, "Ctrl+O to open a PDF")
 
-    def set_dimension_rects(self, rects_pt: list[tuple[float, float, float, float]]):
-        """Rectangles in PDF points (x0, top, x1, bottom)."""
+    def set_dimension_rects(
+        self,
+        rects_pt: list[tuple[float, float, float, float]],
+        kinds: Optional[list[str]] = None,
+    ):
         self._dim_rects_pt = rects_pt or []
+        if kinds is None:
+            self._dim_kinds = [""] * len(self._dim_rects_pt)
+        else:
+            n = len(self._dim_rects_pt)
+            self._dim_kinds = (kinds + [""] * n)[:n]  # pad/trim to match
         self.update()
-
 
 
 # -------------------------
@@ -534,6 +552,7 @@ class UIApp(QtWidgets.QMainWindow):
         self._on_save = on_save or self._default_save
 
         # --- Type-ahead field buffer ---
+        this = self
         self._field_buffer: str = ""
         self._fieldbuf_timeout_ms = 4000  # configurable: 4s
         self._fieldbuf_timer = QtCore.QTimer(self)
@@ -541,6 +560,13 @@ class UIApp(QtWidgets.QMainWindow):
         self._fieldbuf_timer.timeout.connect(self._on_fieldbuf_timeout)
         self._pdf_list: list[str] | None = None
         self._pdf_index: int = -1
+
+        # --- Inline length entry (HUD) ---
+        self._length_input_active: bool = False
+        self._length_buffer: str = ""
+
+        # Keep latest analysis (optional)
+        self._last_analysis = None
 
         # Central layout: PDF canvas + HUD overlay on top
         central = QtWidgets.QWidget(self)
@@ -558,19 +584,30 @@ class UIApp(QtWidgets.QMainWindow):
         self.router = KeyRouter()
         self.prompts = PromptBuilder(self.registry)
 
-        # Initial HUD
+        # --- Menu (discoverability for resets) ---
+        bar = self.menuBar()
+        m_file = bar.addMenu("&File")
+
+        act_open = m_file.addAction("Open…")
+        act_open.setShortcut("Ctrl+O")
+        act_open.triggered.connect(self._open_pdf_dialog)
+
+        act_reset_section = m_file.addAction("Reset Section")
+        act_reset_section.setShortcut("Ctrl+R")
+        act_reset_section.triggered.connect(lambda: self._dispatch(Action(Action.RESET_SECTION)))
+
+        act_start_over = m_file.addAction("Start Over (This PDF)")
+        act_start_over.setShortcut("Ctrl+Shift+R")
+        act_start_over.triggered.connect(lambda: self._dispatch(Action(Action.START_OVER)))
+
+        # Initial HUD + nice default sizing
         self._refresh_hud()
         screen = QtWidgets.QApplication.primaryScreen()
         geometry = screen.availableGeometry()
-
         w = int(geometry.width() * 0.8)
         h = int(geometry.height() * 0.8)
-
         self.resize(w, h)
-        self.move(
-            (geometry.width() - w) // 2,
-            (geometry.height() - h) // 2
-        )
+        self.move((geometry.width() - w) // 2, (geometry.height() - h) // 2)
 
     def load_pdf_list(self, paths: list[str]):
         """Set a list of PDFs to process; open the first."""
@@ -617,7 +654,6 @@ class UIApp(QtWidgets.QMainWindow):
 
         self._open_next_pdf(initial=False)
 
-
     def _load_pdf_path(self, path: str):
         """Open a specific PDF and reset app state for a fresh annotation session."""
         try:
@@ -636,31 +672,26 @@ class UIApp(QtWidgets.QMainWindow):
             self._token_buffer = None
             self._field_buffer = ""
             self._fieldbuf_timer.stop()
+            self._length_input_active = False
+            self._length_buffer = ""
 
             # Initial HUD
             self._refresh_hud()
 
-            # === NEW: analyze current page and draw dimension boxes + store values ===
+            # Analyze current page and draw dimension boxes
             analysis = analyze_page(
                 pdf_path=path,
                 page_index=self.store.state.pdf.page,
-                dpi=150,  # you can make this configurable if you want
+                dpi=150,
             )
 
-            # Keep latest analysis for HUD/export/etc.
-            self._last_analysis = analysis  # add: define self._last_analysis in __init__ (e.g., None)
+            self._last_analysis = analysis
 
-            # Overlay only the dimension rectangles (PDF points) on the canvas
             rects_pt = [d.bbox_pt for d in (analysis.dimensions or [])]
+            kinds    = [d.kind    for d in (analysis.dimensions or [])]
             if hasattr(self.canvas, "set_dimension_rects"):
-                self.canvas.set_dimension_rects(rects_pt)  # painter will map PDF-pt → screen and draw
+                self.canvas.set_dimension_rects(rects_pt, kinds)
 
-            # (Optional) You can also surface parsed numbers in the HUD/toasts here:
-            # for d in analysis.dimensions:
-            #     if d.value is not None:
-            #         self.toast(f"{d.kind}: {d.value}", ttl=1.0)
-
-            # Ensure repaint after overlays are set
             self.canvas.update()
 
         except Exception as e:
@@ -678,17 +709,15 @@ class UIApp(QtWidgets.QMainWindow):
             analysis = analyze_page(
                 pdf_path=path,
                 page_index=page_index,
-                dpi=150,  # you can expose this if you want; doesn't affect UI scale
-                # leave default search window & thresholds, or pass your own
+                dpi=150,
             )
 
             rects_pt = [d.bbox_pt for d in analysis.dimensions]
-            self.canvas.set_dimension_rects(rects_pt)
+            kinds    = [d.kind    for d in analysis.dimensions]
+            self.canvas.set_dimension_rects(rects_pt, kinds)
         except Exception as e:
-            # Fail-safe: don't crash UI if analysis fails
             self.canvas.set_dimension_rects([])
             self.toast(f"Analyzer: {e}", ttl=2.0)
-
 
     # ---------- Type-ahead helpers ----------
     @staticmethod
@@ -745,9 +774,7 @@ class UIApp(QtWidgets.QMainWindow):
         if len(matches) == 1:
             self._commit_choice_and_flash(matches[0])
         else:
-            # ambiguous or no match → wait for more chars (HUD will update)
             self._refresh_hud()
-
 
     def _handle_maybe_numeric_char(self, ch: str) -> bool:
         """
@@ -781,42 +808,6 @@ class UIApp(QtWidgets.QMainWindow):
             self.toast(str(e), ttl=1.5)
             return True  # handled (don’t feed buffer)
 
-    def _handle_maybe_numeric_char(self, ch: str) -> bool:
-        """
-        Si le champ actif est de type 'int' et que `ch` est un chiffre,
-        on commit directement la valeur et on avance. Retourne True si consommé.
-        """
-        st = self.store.state
-        if st.mode != Mode.FIELD_EDITING or not st.editing:
-            return False
-        if not ch or len(ch) != 1 or not ch.isdigit():
-            return False
-
-        # Récupérer le schema du champ courant
-        spec = self.registry.get_spec(st.editing.type_id)
-        seq = st.editing.field_sequence
-        if not (0 <= st.editing.index < len(seq)):
-            return False
-        fname = seq[st.editing.index]
-        fdef = spec.get("fields", {}).get(fname, {})
-        ftype = fdef.get("type", "enum")
-        if ftype != "int":
-            return False
-
-        # Tente de fixer la valeur (le reducer re-valide via registry.validate_value)
-        try:
-            self.store.apply(SetFieldValue(int(ch)))
-            self.store.apply(NextField())
-            self._field_buffer = ""
-            self._fieldbuf_timer.stop()
-            self.toast(ch, ttl=0.15)  # petit flash visuel
-            self._refresh_hud()
-            return True
-        except ValueError as e:
-            # chiffre hors plage/interdit → on ne consomme pas, laisse le flux normal
-            self.toast(str(e), ttl=1.5)
-            return True  # on a géré (affiché un toast), évite d'ajouter au buffer
-
     def _commit_choice_and_flash(self, label: str):
         """Commit label, flash briefly, then advance to next field."""
         try:
@@ -825,7 +816,6 @@ class UIApp(QtWidgets.QMainWindow):
             self.toast(str(e), ttl=2.0)
             return
         self._field_buffer = ""  # reset on commit
-        # brief flash
         self.toast(label, ttl=0.2)
         QtCore.QTimer.singleShot(120, self._advance_after_commit)
 
@@ -863,6 +853,56 @@ class UIApp(QtWidgets.QMainWindow):
         self.hud.setGeometry(self.centralWidget().geometry())
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        # --- Inline Section Length Mode (captures keys before router) ---
+        if self._length_input_active:
+            key = event.key()
+            text = event.text() or ""
+
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if self._length_buffer.isdigit():
+                    val = int(self._length_buffer)
+                    sec = self.store.state.get_active_section()
+                    if sec:
+                        try:
+                            self.store.apply(SetSectionLength(section_id=sec.id, length=val))
+                            self.toast(f"S{sec.number} length = {val} in", ttl=1.0)
+                        except Exception as e:
+                            self.toast(str(e), ttl=2.0)
+                else:
+                    self.toast("Enter a numeric length (digits only)", ttl=1.8)
+
+                self._length_input_active = False
+                self._length_buffer = ""
+                self._refresh_hud()
+                event.accept()
+                return
+
+            if key == Qt.Key_Escape:
+                self._length_input_active = False
+                self._length_buffer = ""
+                self._refresh_hud()
+                event.accept()
+                return
+
+            if key == Qt.Key_Backspace:
+                if self._length_buffer:
+                    self._length_buffer = self._length_buffer[:-1]
+                    self._refresh_hud()
+                event.accept()
+                return
+
+            # accept only digits
+            if text.isdigit():
+                self._length_buffer += text
+                self._refresh_hud()
+                event.accept()
+                return
+
+            # ignore all other keys while in length mode
+            event.accept()
+            return
+
+        # --- normal flow if not in length mode ---
         try:
             action = self.router.route(self.store.state, event, token_active=self._token_buffer is not None)
             self._dispatch(action)
@@ -893,6 +933,11 @@ class UIApp(QtWidgets.QMainWindow):
             self._field_buffer = ""
             self._fieldbuf_timer.stop()
             self.toast(f"New section: {name}", ttl=1.2)
+
+            # Start inline length entry (HUD-driven)
+            self._length_input_active = True
+            self._length_buffer = ""
+            self._refresh_hud()
 
         elif kind == Action.TOKEN_APPEND:
             ch = str(pay)
@@ -975,10 +1020,9 @@ class UIApp(QtWidgets.QMainWindow):
             total = max(1, self.store.state.pdf.page_count)
             self.toast(f"Page {page}/{total}", ttl=0.8)
 
-            # NEW
+            # Update overlays
             self._update_dimension_overlays()
             self.canvas.update()
-
 
         elif kind == Action.SET_ZOOM:
             zoom = float(pay)
@@ -1007,9 +1051,67 @@ class UIApp(QtWidgets.QMainWindow):
             self.store.apply(NextSection())
             self.toast(f"Section S{self.store.state.get_active_section().number}", ttl=0.8)
 
-        # >>> NEW: advance to the next PDF in playlist (only fires when not editing)
+        # >>> advance to the next PDF in playlist (only fires when not editing)
         elif kind == Action.NEXT_PDF:
             self._next_pdf()
+
+        # --- Reset active section (Ctrl+R): clears components AND length, then re-prompt length ---
+        elif kind == Action.RESET_SECTION:
+            sec = self.store.state.get_active_section()
+            if not sec:
+                self.toast("No active section", ttl=1.5); self._refresh_hud(); return
+            ans = QtWidgets.QMessageBox.question(
+                self, "Reset Section",
+                f"Clear Section S{sec.number} (components and length)?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
+            )
+            if ans != QtWidgets.QMessageBox.Yes:
+                self._refresh_hud(); return
+            try:
+                # Reducer version with no args:
+                self.store.apply(ResetSection())
+                # Immediately re-prompt for length
+                self._token_buffer = None
+                self._field_buffer = ""
+                self._fieldbuf_timer.stop()
+                self._length_input_active = True
+                self._length_buffer = ""
+                sec2 = self.store.state.get_active_section()
+                if sec2:
+                    self.toast(f"Section S{sec2.number} reset — enter length", ttl=1.4)
+                else:
+                    self.toast("Section reset — enter length", ttl=1.4)
+            except Exception as e:
+                self.toast(str(e), ttl=2.0)
+
+        # --- Start over for this PDF (Ctrl+Shift+R) ---
+        elif kind == Action.START_OVER:
+            if not self.store.state.pdf.path:
+                self.toast("No PDF loaded", ttl=1.5); self._refresh_hud(); return
+            ans = QtWidgets.QMessageBox.question(
+                self, "Start Over",
+                "This will clear ALL sections/components for this PDF.\nContinue?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
+            )
+            if ans != QtWidgets.QMessageBox.Yes:
+                self._refresh_hud(); return
+            path = self.store.state.pdf.path
+            page = self.store.state.pdf.page
+            # Fresh store but preserve current PDF context
+            self.store = Store(registry=self.registry)
+            self.store.state.pdf.path = path
+            self.store.state.pdf.page_count = self.pdf.page_count
+            self.store.state.pdf.page = page
+            # Clear transient UI buffers
+            self._token_buffer = None
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
+            self._length_input_active = False
+            self._length_buffer = ""
+            # Re-render & overlays
+            self.canvas.refit()
+            self._update_dimension_overlays()
+            self.toast("Cleared annotations for this PDF", ttl=1.2)
 
         self._refresh_hud()
 
@@ -1018,6 +1120,16 @@ class UIApp(QtWidgets.QMainWindow):
     def _refresh_hud(self):
         msgs = [m for (m, t) in self._toasts if t > time.time()]
         model = self.prompts.build(self.store.state, self._token_buffer, msgs, field_buffer=self._field_buffer)
+
+        # Inline length HUD overlay
+        if self._length_input_active:
+            sec = self.store.state.get_active_section()
+            secnum = sec.number if sec else "?"
+            model.title = f"Section S{secnum} — enter length (inches)"
+            model.hints = ["Type digits • Backspace to edit • Enter to confirm • Esc to skip"]
+            disp = self._length_buffer if self._length_buffer else ""
+            model.token_ui = f"length: {disp}▎"
+
         self.hud.set_model(model)
         self.canvas.update()
 

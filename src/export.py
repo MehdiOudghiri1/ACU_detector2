@@ -91,9 +91,8 @@ def _build_export_dict(state: AppState, registry: PluginRegistry) -> Dict[str, A
     for sec in state.sections:
         sec_entry: Dict[str, Any] = {
             "Section Number": sec.number,
-            "Length": sec.length,
+            "Length": sec.length,  # may be None until the user enters it
         }
-        # Include "Name" only if present
         if getattr(sec, "name", None):
             sec_entry["Name"] = sec.name
 
@@ -108,12 +107,9 @@ def _build_export_dict(state: AppState, registry: PluginRegistry) -> Dict[str, A
                 fdef = spec.get("fields", {}).get(fname, {})
                 field_label = fdef.get("label") or _humanize_field(fname)
                 value = comp.fields.get(fname, None)
-                field_block[field_label] = value  # value is already normalized by reducer/registry
+                field_block[field_label] = value
 
-            comp_obj = {
-                "Label": comp_label,
-                type_key: field_block,
-            }
+            comp_obj = {"Label": comp_label, type_key: field_block}
             comps_out.append(comp_obj)
 
         if comps_out:
@@ -121,9 +117,16 @@ def _build_export_dict(state: AppState, registry: PluginRegistry) -> Dict[str, A
 
         sections_out.append(sec_entry)
 
+    # Tally section count and lengths list
     out["Unit Properties"]["Unit size"]["Section quantity"] = len(sections_out)
     out["Unit Properties"]["Unit size"]["Section length"] = sections_out
+
+    # NEW: compute Unit Length = sum of per-section Lengths (ignoring None)
+    total_unit_length = sum((sec.get("Length") or 0) for sec in sections_out)
+    out["Unit Properties"]["Unit size"]["Unit Length"] = total_unit_length
+
     return out
+
 
 
 def _unit_tag_from_state(state: AppState) -> Optional[str]:

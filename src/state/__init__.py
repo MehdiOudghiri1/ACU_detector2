@@ -19,7 +19,7 @@ from .commands import (
     Command,
     NewSection, StartComponent, SetFieldValue, NextField, PrevField,
     CommitComponent, CancelDraft, RenameSection, SetSectionLength,
-    NavPage, SetPage, SetZoom, MarkSaved, NextSection, PrevSection
+    NavPage, SetPage, SetZoom, MarkSaved, NextSection, PrevSection, ResetSection
 )
 from .protocol import RegistryProtocol
 from .reducer import reduce
@@ -33,7 +33,7 @@ __all__ = [
     "Command",
     "NewSection", "StartComponent", "SetFieldValue", "NextField", "PrevField",
     "CommitComponent", "CancelDraft", "RenameSection", "SetSectionLength",
-    "NavPage", "SetPage", "SetZoom", "MarkSaved", "NexSection", "PrevSection",
+    "NavPage", "SetPage", "SetZoom", "MarkSaved", "NexSection", "PrevSection", "ResetSection"
     # protocol & reducer & store
     "RegistryProtocol", "reduce", "Store",
 ]

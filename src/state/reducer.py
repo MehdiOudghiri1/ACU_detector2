@@ -11,7 +11,7 @@ from .model import (
 from .commands import (
     Command, NewSection, StartComponent, SetFieldValue, NextField, PrevField,
     CommitComponent, CancelDraft, RenameSection, SetSectionLength,
-    NavPage, SetPage, SetZoom, MarkSaved,
+    NavPage, SetPage, SetZoom, MarkSaved, ResetSection
 )
 from .protocol import RegistryProtocol
 from .commands import PrevSection, NextSection
@@ -94,6 +94,19 @@ def reduce(state: AppState, cmd: Command, registry: RegistryProtocol) -> AppStat
         # ⟵⟵⟵ FIN AJOUT
         return s
 
+    if isinstance(cmd, ResetSection):
+        sec = _find_section(s, cmd.section_id)
+        if not sec:
+            raise ValueError("Unknown section.")
+        # Clear components; keep length unless caller asks to clear it.
+        sec.components.clear()
+        if cmd.clear_length:
+            sec.length = None
+        # If we were editing a draft, exit editing mode
+        s.editing = None
+        s.mode = Mode.SECTION_ACTIVE
+        s.dirty = True
+        return s
         
 
     # --- Next / Prev field ---

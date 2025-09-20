@@ -42,6 +42,8 @@ def reduce(state: AppState, cmd: Command, registry: RegistryProtocol) -> AppStat
         s.dirty = True
         return s
 
+        
+
     # --- Start component ---
     if isinstance(cmd, StartComponent):
         if s.mode != Mode.SECTION_ACTIVE:
@@ -82,7 +84,17 @@ def reduce(state: AppState, cmd: Command, registry: RegistryProtocol) -> AppStat
             raise ValueError(err or f"Invalid value for {field_name}: {cmd.value}")
         draft.values[field_name] = normalized
         s.dirty = True
+
+            # ⟵⟵⟵ AJOUTER CE BLOC
+        if getattr(cmd, "auto_advance", False):
+            last_idx = len(draft.field_sequence) - 1
+            if draft.index >= last_idx and _all_required_set(draft, registry):
+                return _commit_current_draft(s)
+            draft.index = min(draft.index + 1, last_idx)
+        # ⟵⟵⟵ FIN AJOUT
         return s
+
+        
 
     # --- Next / Prev field ---
     if isinstance(cmd, NextField):

@@ -96,3 +96,29 @@ class PluginRegistry(RegistryProtocol):
                 if not t:
                     continue
                 self._aliases.setdefault(_lc(t), tid)  # first writer wins
+    
+    def all_specs(self) -> dict:
+        """
+        Return a shallow copy of all component specs:
+        {type_id: spec_dict}
+        """
+        return dict(self._specs)
+
+    def type_keys(self) -> list[str]:
+        """
+        Return the list of all component type_keys (fallback to type_id).
+        Used by export._detect_type_block to recognize component blocks.
+        """
+        out = []
+        for type_id, spec in self._specs.items():
+            out.append(spec.get("type_key", type_id))
+        return out
+
+    def type_id_from_type_key(self, type_key: str) -> str | None:
+        """
+        Map a type_key back to its type_id. Returns None if not found.
+        """
+        for type_id, spec in self._specs.items():
+            if spec.get("type_key", type_id) == type_key:
+                return type_id
+        return None

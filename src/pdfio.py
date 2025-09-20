@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional
 import threading
 import fitz  # PyMuPDF
-from PySide6 import QtGui
+from PySide6 import QtCore, QtGui   # <-- add QtCore
 
 @dataclass
 class _RenderCache:
@@ -191,4 +191,31 @@ class PdfIO:
         self.zoom = scale
         self._fit_width_enabled = False  # explicitly fit-page mode
         self._last = self._render_by_zoom(self.page, scale, dpr=dpr)
+
+    def page_size_pts(self) -> tuple[float, float]:
+        """Return (width_pts, height_pts) for the current page."""
+        if not self._doc:
+            return (0.0, 0.0)
+        page = self._doc.load_page(self.page)
+        r = page.rect
+        return (float(r.width), float(r.height))
+
+    def rect_pdfpt_to_qrectf(self, rect_pt: tuple[float, float, float, float], img: QtGui.QImage) -> QtCore.QRectF:
+        """
+        Map a PDF-points rect (x0, top, x1, bottom) to the QRectF we actually draw,
+        taking into account the current zoom (pixels-per-point) and device pixel ratio.
+        Returned rect is in *logical* Qt coordinates (matches painter.drawImage call).
+        """
+        dpr = max(1.0, img.devicePixelRatio())
+        scale = float(self.zoom)        # pixels per point (in device pixels)
+        x0, top, x1, bottom = rect_pt
+
+        # convert to *device* pixels
+        dx = x0 * scale
+        dy = top * scale
+        dw = (x1 - x0) * scale
+        dh = (bottom - top) * scale
+
+        # convert to *logical* Qt coords (Qt divides by DPR when painting)
+        return QtCore.QRectF(dx / dpr, dy / dpr, dw / dpr, dh / dpr)  # <-- QtCore.QRectF
 

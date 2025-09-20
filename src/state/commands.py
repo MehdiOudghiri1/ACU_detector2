@@ -24,8 +24,8 @@ class StartComponent(Command):
 
 @dataclass
 class SetFieldValue(Command):
-    """Set current field's value (already mapped from key → value by UI, or raw for registry to normalize)."""
-    value: Any = None
+    value: Any
+    auto_advance: bool = False   # ⟵ AJOUT
 
 
 @dataclass

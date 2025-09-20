@@ -78,14 +78,15 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="ACU PDF Annotator")
-    parser.add_argument("pdf", nargs="?", help="Path to PDF to open")
+    parser.add_argument("target", nargs="?", help="Path to a PDF file or a folder of PDFs")
     parser.add_argument("--config", "-c", help="Path to config.yaml", default=None)
+    parser.add_argument("--recursive", "-r", action="store_true", help="When target is a folder, include PDFs in subfolders")
     args = parser.parse_args(argv)
 
     # Load config
     config = load_config(args.config)
 
-    # Registry (loads built-in specs; then apply aliases from config)
+    # Registry (loads built-ins + aliases)
     registry = PluginRegistry()
     _apply_aliases_from_config(registry, config.get("aliases", {}))
 
@@ -96,53 +97,135 @@ def main(argv: Optional[list[str]] = None) -> int:
         workers=int(config["pdf"].get("workers", 2)),
     )
 
-    # Exporter + on_save callback (uses config)
-    exporter = Exporter(registry)
-    def on_save():
-        data = exporter.build(store.state)
-        ok, errs = exporter.validate(data)
-        if not ok:
-            # Let UI toast the first few errors via exception; UIApp catches and shows
-            raise ValueError("\n".join(errs[:5]))
-        text = exporter.dumps(data, pretty=bool(config["export"].get("pretty", True)))
-        out_path = exporter.filename(store.state, config["export"].get("filename_template", "{tag}_p{page}.json"))
-        Path(out_path).write_text(text, encoding="utf-8")
-        store.apply(MarkSaved(when=time.time()))
-
     # UI
     qt = QtWidgets.QApplication(sys.argv)
-    ui = UIApp(on_save=on_save)
-    ui.store = store  # inject same store we created
+    ui = UIApp()                         # on_save is set below so it can close over ui
+    ui.store = store
     ui.registry = registry
     ui.pdf = pdfio
-    ui.canvas.pdf = pdfio  # ensure canvas points to the same PdfIO
+    ui.canvas.pdf = pdfio
 
-    # Open PDF if provided
-    if args.pdf:
-        p = Path(args.pdf)
-        if p.exists():
-            try:
-                pdfio.open(str(p))
-                # reflect into state so UI footer / filename templating work
-                ui.store.state.pdf.path = str(p)
-                ui.store.state.pdf.page_count = pdfio.page_count
-                ui.store.state.pdf.page = 0
-                ui.canvas.update()
-                ui.toast(f"Opened {p.name}", ttl=1.2)
-            except Exception as e:
-                ui.toast(f"Failed to open PDF: {e}", ttl=3.0)
+    # Exporter + config
+    exporter = Exporter(registry)
+    filename_tmpl = config["export"].get("filename_template", "{tag}_p{page}.json")
+    pretty = bool(config["export"].get("pretty", True))
+
+    # ---- Batch context (app-side) ----
+    staged: list[tuple[str, str]] = []   # (basename, json_text)
+    playlist_root: Optional[Path] = None
+    batch_mode = False
+
+    def _suggest_basename_from_state() -> str:
+        """Use Exporter.filename (based on ui.store.state.pdf.path/meta) but keep only the basename."""
+        full = exporter.filename(ui.store.state, filename_tmpl)
+        return Path(full).name
+
+    def _stage_current() -> None:
+        """Build+validate+dumps current JSON and push into 'staged' (NO disk IO)."""
+        data = exporter.build(ui.store.state)
+        ok, errs = exporter.validate(data)
+        if not ok:
+            # Keep strict; user should finish required fields before moving on.
+            raise ValueError("\n".join(errs[:5]))
+        text = exporter.dumps(data, pretty=pretty)
+        staged.append((_suggest_basename_from_state(), text))
+
+    def _write_all(include_current: bool) -> None:
+        """Write all staged JSON (and optionally the current) into <input_folder_name>_jsons."""
+        items = list(staged)
+        if include_current:
+            data = exporter.build(ui.store.state)
+            ok, errs = exporter.validate(data)
+            if not ok:
+                raise ValueError("\n".join(errs[:5]))
+            text = exporter.dumps(data, pretty=pretty)
+            items.append((_suggest_basename_from_state(), text))
+
+        if not items:
+            return
+
+        # Determine output dir: sibling next to the input folder (or the single PDF's folder)
+        if playlist_root:
+            out_dir = playlist_root.parent / f"{playlist_root.name}_jsons"
         else:
-            ui.toast(f"PDF not found: {p}", ttl=3.0)
+            pdf_path = getattr(ui.store.state.pdf, "path", None)
+            if not pdf_path:
+                raise ValueError("No PDF path to determine output folder")
+            pdf_dir = Path(pdf_path).expanduser().resolve().parent
+            out_dir = pdf_dir.parent / f"{pdf_dir.name}_jsons"
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for basename, text in items:
+            (out_dir / basename).write_text(text, encoding="utf-8")
+
+    # Ctrl+S: write EVERY JSON now.
+    # - Folder mode: write all STAGED + the CURRENT PDF into <input_folder>_jsons
+    # - Single file: write the CURRENT PDF into <pdf_folder>_jsons (consistent output location)
+    def on_save():
+        if batch_mode:
+            # Write everything we've staged (from previous PDFs) + the current PDF
+            _write_all(include_current=True)
+            staged.clear()  # avoid duplicates on subsequent Ctrl+S
+            ui.store.apply(MarkSaved(when=time.time()))
+            ui.toast("All staged JSONs (and current) written.", ttl=1.5)
+        else:
+            # Single-file: write current into <pdf_folder>_jsons for consistency
+            data = exporter.build(ui.store.state)
+            ok, errs = exporter.validate(data)
+            if not ok:
+                raise ValueError("\n".join(errs[:5]))
+            text = exporter.dumps(data, pretty=pretty)
+            # Determine output folder next to this single PDF's folder: <pdf_folder>_jsons
+            pdf_path = getattr(ui.store.state.pdf, "path", None)
+            if not pdf_path:
+                raise ValueError("No PDF path to determine output folder")
+            pdf_dir = Path(pdf_path).expanduser().resolve().parent
+            out_dir = pdf_dir.parent / f"{pdf_dir.name}_jsons"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            basename = Path(exporter.filename(ui.store.state, filename_tmpl)).name
+            (out_dir / basename).write_text(text, encoding="utf-8")
+            ui.store.apply(MarkSaved(when=time.time()))
+            ui.toast("Saved JSON.", ttl=1.0)
+
+
+    # Inject on_save now that it closes over ui
+    ui._on_save = on_save if hasattr(ui, "_on_save") else None  # in case you wired via ctor elsewhere
+    # Preferred: pass via constructor if your UIApp accepts on_save; otherwise keep callback in a menu/shortcut
+    # If your constructor already accepts on_save, re-create as: ui = UIApp(on_save=on_save)
+
+    # Give UI a chance to stage before moving to next PDF (plain 'n')
+    ui._on_before_next_pdf = _stage_current
+
+    # Open file or build playlist if 'target' provided
+    if args.target:
+        p = Path(args.target).expanduser().resolve()
+        if p.is_dir():
+            batch_mode = True
+            playlist_root = p
+            pattern = "**/*.pdf" if args.recursive else "*.pdf"
+            pdfs = sorted(str(x) for x in p.glob(pattern))
+            if pdfs:
+                ui.load_pdf_list(pdfs)
+                ui.toast(f"Loaded {len(pdfs)} PDFs from {p}", ttl=1.2)
+            else:
+                ui.toast(f"No PDFs found in {p}", ttl=2.5)
+        elif p.is_file() and p.suffix.lower() == ".pdf":
+            ui.load_pdf_list([str(p)])
+            ui.toast(f"Opened {p.name}", ttl=1.2)
+        else:
+            ui.toast(f"Not a PDF or directory: {p}", ttl=3.0)
 
     # Minimal menubar (Open/Save/Exit)
     _install_menu(ui, on_save_cb=on_save)
 
-    # Autosave (silent): every N seconds if dirty
-    if config.get("autosave", {}).get("enabled", True):
+    # Autosave: disable in batch mode (write everything at the end)
+    if config.get("autosave", {}).get("enabled", True) and not batch_mode:
         _install_autosave_timer(ui, exporter, config)
 
     ui.show()
     return qt.exec()
+
 
 
 # ---------------------------

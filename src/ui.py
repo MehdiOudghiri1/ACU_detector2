@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt
 
 from registry import PluginRegistry
 from state import (
@@ -15,6 +16,8 @@ from state import (
     CancelDraft, NavPage, SetZoom, MarkSaved,
 )
 from pdfio import PdfIO
+from dimension_extractor import analyze_page
+
 
 
 # -------------------------
@@ -31,7 +34,7 @@ class Action:
     TOKEN_APPEND = "TOKEN_APPEND"
     TOKEN_SUBMIT = "TOKEN_SUBMIT"
     TOKEN_CLEAR = "TOKEN_CLEAR"
-    SET_FIELD_VALUE = "SET_FIELD_VALUE"
+    SET_FIELD_VALUE = "SET_FIELD_VALUE"  # kept for backward-compat (not used by type-ahead)
     NEXT_FIELD = "NEXT_FIELD"
     PREV_FIELD = "PREV_FIELD"
     CANCEL_DRAFT = "CANCEL_DRAFT"
@@ -45,7 +48,16 @@ class Action:
     TOKEN_BACKSPACE = "TOKEN_BACKSPACE"
     PREV_SECTION = "PREV_SECTION"
     NEXT_SECTION = "NEXT_SECTION"
+    # Type-ahead (field)
+    FIELDBUF_APPEND = "FIELDBUF_APPEND"
+    FIELDBUF_BACKSPACE = "FIELDBUF_BACKSPACE"
+    FIELDBUF_CLEAR = "FIELDBUF_CLEAR"
+    NEXT_PDF = "NEXT_PDF"
 
+
+# -------------------------
+# KeyRouter (mode-aware)
+# -------------------------
 
 # -------------------------
 # KeyRouter (mode-aware)
@@ -84,23 +96,30 @@ class KeyRouter:
             if key == QtCore.Qt.Key_Down:
                 return Action(Action.NEXT_SECTION)
 
-
-        # --- Mode-specific ---
+        # --- Mode-specific: FIELD_EDITING ---
         if state.mode == Mode.FIELD_EDITING:
             if key == QtCore.Qt.Key_Tab and not (mods & QtCore.Qt.ShiftModifier):
                 return Action(Action.NEXT_FIELD)
             if key == QtCore.Qt.Key_Backtab or (key == QtCore.Qt.Key_Tab and (mods & QtCore.Qt.ShiftModifier)):
                 return Action(Action.PREV_FIELD)
-            if key == QtCore.Qt.Key_Backspace or key == QtCore.Qt.Key_Escape:
-                return Action(Action.CANCEL_DRAFT)
-            # Character input for current field
+            # Type-ahead editing behaviour
+            if key == QtCore.Qt.Key_Backspace:
+                return Action(Action.FIELDBUF_BACKSPACE)
+            if key == QtCore.Qt.Key_Escape:
+                return Action(Action.FIELDBUF_CLEAR)
+            # Character input for current field (passes to type-ahead / numeric handler in dispatcher)
             if text and not (mods & QtCore.Qt.ControlModifier):
                 ch = text.strip()
                 if ch:
-                    return Action(Action.SET_FIELD_VALUE, ch)
+                    return Action(Action.FIELDBUF_APPEND, ch)
             return Action(Action.NOOP)
 
-        # SECTION_ACTIVE (and IDLE behaves the same for MVP)
+        # --- Next PDF (plain 'n') ---
+        # Only when NOT editing a field and NOT typing a token
+        if key == QtCore.Qt.Key_N and not (mods & QtCore.Qt.ControlModifier) and not token_active:
+            return Action(Action.NEXT_PDF)
+
+        # --- SECTION_ACTIVE (and IDLE behaves the same for MVP) ---
         if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
             # If in token typing, submit token. Otherwise create new section.
             if token_active:
@@ -124,6 +143,7 @@ class KeyRouter:
         return Action(Action.NOOP)
 
 
+
 # -------------------------
 # Prompt/HUD model
 # -------------------------
@@ -138,22 +158,29 @@ class FieldChip:
 class HudModel:
     title: str
     fields: List[FieldChip]
-    hints: List[str]
+    hints: List[str]             # help lines
     token_ui: Optional[str]
     foot: str  # e.g., filename / page / zoom
     toasts: List[str]
+    # Options visualisation for active field (prefix highlight)
+    options_visual: List[Tuple[str, int]]  # (label, match_prefix_len) ; 0 if no match
+    ambiguous: bool
+    no_match: bool
 
 
 class PromptBuilder:
     def __init__(self, registry: PluginRegistry):
         self.registry = registry
 
-    def build(self, state, token_buffer: Optional[str], toasts: List[str]) -> HudModel:
+    def build(self, state, token_buffer: Optional[str], toasts: List[str], field_buffer: str = "") -> HudModel:
         # Title + fields + hints
         title = ""
         fields: List[FieldChip] = []
         hints: List[str] = []
         token_ui: Optional[str] = None
+        options_visual: List[Tuple[str, int]] = []
+        ambiguous = False
+        no_match = False
 
         if state.mode == Mode.FIELD_EDITING and state.editing:
             spec = self.registry.get_spec(state.editing.type_id)
@@ -168,15 +195,44 @@ class PromptBuilder:
             if 0 <= idx < len(seq):
                 fdef = spec.get("fields", {}).get(seq[idx], {})
                 ftype = fdef.get("type", "enum")
-                if ftype == "enum":
-                    m = fdef.get("map", {})
-                    short_keys = [k for k in m.keys() if len(k) == 1]
-                    if short_keys:
-                        hints = ["/".join(short_keys).upper()]
-                    else:
-                        hints = ["/".join(sorted(set(m.values())))]
-                elif ftype == "bool":
-                    hints = ["Y/N"]
+
+                # Always display full labels for enum/bool
+                def _labels_for():
+                    if ftype == "bool":
+                        return ["Yes", "No"]
+                    if ftype == "enum":
+                        # unique-preserving
+                        return list(dict.fromkeys(fdef.get("map", {}).values()))
+                    return []
+
+                labels = _labels_for()
+                if labels:
+                    # Visual matching of buffer
+                    def _fold(s: str) -> str:
+                        import unicodedata as _ud
+                        s = _ud.normalize("NFD", s)
+                        s = "".join(c for c in s if _ud.category(c) != "Mn")
+                        return s.casefold()
+                    fb = _fold(field_buffer) if field_buffer else ""
+                    matches = []
+                    for L in labels:
+                        if fb and _fold(L).startswith(fb):
+                            matches.append(L)
+                            options_visual.append((L, len(field_buffer)))
+                        else:
+                            options_visual.append((L, 0))
+                    if field_buffer:
+                        if matches:
+                            ambiguous = len(matches) > 1
+                            if ambiguous:
+                                hints.append("keep typing…")
+                        else:
+                            no_match = True
+                            hints.append("no match")
+                        hints.append(f"typed: {field_buffer}▎")
+                    # Options line
+                    hints.insert(0, "Options: " + " / ".join(labels))
+
                 elif ftype == "int":
                     minv = fdef.get("min"); maxv = fdef.get("max")
                     if minv is not None and maxv is not None:
@@ -213,6 +269,9 @@ class PromptBuilder:
             token_ui=token_ui,
             foot=foot,
             toasts=toasts[-3:],  # show up to last 3
+            options_visual=options_visual,
+            ambiguous=ambiguous,
+            no_match=no_match,
         )
 
 
@@ -242,8 +301,8 @@ class HUDOverlay(QtWidgets.QWidget):
 
         # Panel rect (bottom-center)
         margin = 16
-        panel_w = min(self.width() - 2*margin, 900)
-        panel_h = 130 if (self._model.fields or self._model.token_ui) else 90
+        panel_w = min(self.width() - 2*margin, 980)
+        panel_h = 150 if (self._model.fields or self._model.token_ui) else 100
         x = (self.width() - panel_w) // 2
         y = self.height() - panel_h - 24
 
@@ -297,6 +356,45 @@ class HUDOverlay(QtWidgets.QWidget):
             p.drawText(QtCore.QPointF(text_x, cur_y + 18), f"Hints: {hints}")
             cur_y += 24
 
+        # Options visual line (labels with prefix underlined/bold)
+        if self._model.options_visual:
+            font = p.font()
+            font.setPointSizeF(10.5)
+            p.setFont(font)
+            seg_x = text_x
+            gap = 16
+            for label, pref_len in self._model.options_visual:
+                # split prefix/rest
+                prefix = label[:pref_len]
+                rest = label[pref_len:]
+                # draw pill
+                lab_w = p.fontMetrics().horizontalAdvance(label) + 20
+                rect = QtCore.QRectF(seg_x, cur_y, lab_w, 26)
+                bg = QtGui.QColor(55, 55, 65, 210)
+                p.setBrush(bg)
+                p.setPen(QtCore.Qt.NoPen)
+                p.drawRoundedRect(rect, 6, 6)
+                # text
+                x0 = rect.x() + 10
+                y0 = rect.y() + 18
+                pen_norm = QtGui.QPen(QtGui.QColor(235, 235, 240))
+                pen_emph = QtGui.QPen(QtGui.QColor(255, 255, 255))
+                # prefix bold/underline
+                if pref_len > 0:
+                    f_b = QtGui.QFont(p.font())
+                    f_b.setBold(True)
+                    f_b.setUnderline(True)
+                    p.setFont(f_b); p.setPen(pen_emph)
+                    p.drawText(QtCore.QPointF(x0, y0), prefix)
+                    w_pref = p.fontMetrics().horizontalAdvance(prefix)
+                    p.setFont(font); p.setPen(pen_norm)
+                    p.drawText(QtCore.QPointF(x0 + w_pref, y0), rest)
+                else:
+                    p.setPen(pen_norm)
+                    p.drawText(QtCore.QPointF(x0, y0), label)
+                seg_x += rect.width() + gap
+            cur_y += 32
+
         # Token line
         if self._model.token_ui:
             p.setPen(QtGui.QColor(220, 220, 230))
@@ -342,8 +440,8 @@ class PdfCanvas(QtWidgets.QWidget):
         self.setPalette(pal)
         # Make it fill available space
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self._dim_rects_pt: list[tuple[float, float, float, float]] = []  # PDF-pt rects
 
-# ui.py - PdfCanvas
 
     def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
         super().resizeEvent(e)
@@ -370,12 +468,39 @@ class PdfCanvas(QtWidgets.QWidget):
         y = 8
         painter.drawImage(QtCore.QRect(x, y, iw, ih), img)
 
+                # --- overlays: dimension boxes ---
+        if self._dim_rects_pt:
+            pen = QtGui.QPen(QtGui.QColor(255, 80, 0))  # orange
+            pen.setWidthF(2.0)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+
+            # map PDF-pt rects to logical image coords, then offset by where we drew the image (x,y)
+            for rect_pt in self._dim_rects_pt:
+                r = self.pdf.rect_pdfpt_to_qrectf(rect_pt, img)
+                r.translate(x, y)  # shift into the place where the image was drawn
+                painter.drawRect(r)
+
+
+    def refit(self):
+        """Recompute fit-to-frame for the current page at current DPR."""
+        dpr = self.devicePixelRatioF()
+        HUD_H = 140  # keep in sync with resizeEvent
+        self.pdf.fit_to_frame(self.width(), self.height(), dpr, top_margin=8, bottom_margin=HUD_H)
+        self.update()
+
     def _draw_placeholder(self, p: QtGui.QPainter):
         rect = self.rect()
         p.fillRect(rect, QtGui.QColor(245, 245, 248))
         pen = QtGui.QPen(QtGui.QColor(180, 180, 190))
         p.setPen(pen)
         p.drawText(rect, QtCore.Qt.AlignCenter, "Ctrl+O to open a PDF")
+
+    def set_dimension_rects(self, rects_pt: list[tuple[float, float, float, float]]):
+        """Rectangles in PDF points (x0, top, x1, bottom)."""
+        self._dim_rects_pt = rects_pt or []
+        self.update()
+
 
 
 # -------------------------
@@ -403,8 +528,19 @@ class UIApp(QtWidgets.QMainWindow):
         self._toast_timer.timeout.connect(self._prune_toasts)
         self._toast_timer.start()
 
+        self._on_before_next_pdf = None
+
         # Save callback (can be swapped by app)
         self._on_save = on_save or self._default_save
+
+        # --- Type-ahead field buffer ---
+        self._field_buffer: str = ""
+        self._fieldbuf_timeout_ms = 4000  # configurable: 4s
+        self._fieldbuf_timer = QtCore.QTimer(self)
+        self._fieldbuf_timer.setSingleShot(True)
+        self._fieldbuf_timer.timeout.connect(self._on_fieldbuf_timeout)
+        self._pdf_list: list[str] | None = None
+        self._pdf_index: int = -1
 
         # Central layout: PDF canvas + HUD overlay on top
         central = QtWidgets.QWidget(self)
@@ -436,6 +572,269 @@ class UIApp(QtWidgets.QMainWindow):
             (geometry.height() - h) // 2
         )
 
+    def load_pdf_list(self, paths: list[str]):
+        """Set a list of PDFs to process; open the first."""
+        paths = [p for p in paths if isinstance(p, str)]
+        self._pdf_list = paths if paths else None
+        self._pdf_index = -1
+        if self._pdf_list:
+            self._open_next_pdf(initial=True)
+
+    def _open_next_pdf(self, initial: bool = False):
+        if not self._pdf_list:
+            self.toast("No PDF list loaded", ttl=1.5)
+            return
+        if initial:
+            self._pdf_index = 0
+        else:
+            if self.store.state.mode == Mode.FIELD_EDITING:
+                # Safety: don't switch while editing a field
+                self.toast("Finish current field before switching PDF", ttl=1.5)
+                return
+            self._pdf_index += 1
+        if self._pdf_index >= len(self._pdf_list):
+            self._pdf_index = len(self._pdf_list) - 1
+            self.toast("Reached last PDF", ttl=1.2)
+            return
+        self._load_pdf_path(self._pdf_list[self._pdf_index])
+        self.toast(f"PDF {self._pdf_index + 1}/{len(self._pdf_list)}", ttl=0.8)
+
+    def _next_pdf(self):
+        """Public handler for NEXT_PDF action."""
+        if not self._pdf_list:
+            self.toast("No folder playlist loaded", ttl=1.5)
+            return
+        if self.store.state.mode == Mode.FIELD_EDITING:
+            # Ignore 'n' while editing a field (your requirement)
+            return
+
+        # 🔹 Let app.py stage current JSON before switching
+        if callable(getattr(self, "_on_before_next_pdf", None)):
+            try:
+                self._on_before_next_pdf()
+            except Exception as e:
+                self.toast(f"Stage failed: {e}", ttl=2.0)
+
+        self._open_next_pdf(initial=False)
+
+
+    def _load_pdf_path(self, path: str):
+        """Open a specific PDF and reset app state for a fresh annotation session."""
+        try:
+            self.pdf.open(path)
+            # Reset reducer/store for a fresh document
+            self.store = Store(registry=self.registry)
+            # Keep reducer authoritative for nav logic but set essentials:
+            self.store.state.pdf.path = path              # ⟵ ensure Exporter.filename() picks the right folder
+            self.store.state.pdf.page_count = self.pdf.page_count
+            self.store.state.pdf.page = 0
+
+            # Render first view
+            self.canvas.refit()
+
+            # Clear transient UI buffers
+            self._token_buffer = None
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
+
+            # Initial HUD
+            self._refresh_hud()
+
+            # === NEW: analyze current page and draw dimension boxes + store values ===
+            analysis = analyze_page(
+                pdf_path=path,
+                page_index=self.store.state.pdf.page,
+                dpi=150,  # you can make this configurable if you want
+            )
+
+            # Keep latest analysis for HUD/export/etc.
+            self._last_analysis = analysis  # add: define self._last_analysis in __init__ (e.g., None)
+
+            # Overlay only the dimension rectangles (PDF points) on the canvas
+            rects_pt = [d.bbox_pt for d in (analysis.dimensions or [])]
+            if hasattr(self.canvas, "set_dimension_rects"):
+                self.canvas.set_dimension_rects(rects_pt)  # painter will map PDF-pt → screen and draw
+
+            # (Optional) You can also surface parsed numbers in the HUD/toasts here:
+            # for d in analysis.dimensions:
+            #     if d.value is not None:
+            #         self.toast(f"{d.kind}: {d.value}", ttl=1.0)
+
+            # Ensure repaint after overlays are set
+            self.canvas.update()
+
+        except Exception as e:
+            self.toast(f"Failed to open PDF: {e}", ttl=2.5)
+
+    def _update_dimension_overlays(self):
+        """Analyze the current page and paint dimension boxes on the canvas."""
+        try:
+            path = self.store.state.pdf.path
+            page_index = self.store.state.pdf.page
+            if not path:
+                self.canvas.set_dimension_rects([])
+                return
+
+            analysis = analyze_page(
+                pdf_path=path,
+                page_index=page_index,
+                dpi=150,  # you can expose this if you want; doesn't affect UI scale
+                # leave default search window & thresholds, or pass your own
+            )
+
+            rects_pt = [d.bbox_pt for d in analysis.dimensions]
+            self.canvas.set_dimension_rects(rects_pt)
+        except Exception as e:
+            # Fail-safe: don't crash UI if analysis fails
+            self.canvas.set_dimension_rects([])
+            self.toast(f"Analyzer: {e}", ttl=2.0)
+
+
+    # ---------- Type-ahead helpers ----------
+    @staticmethod
+    def _fold(s: str) -> str:
+        """lower + strip diacritics for prefix comparison."""
+        import unicodedata as _ud
+        s = _ud.normalize("NFD", s)
+        s = "".join(c for c in s if _ud.category(c) != "Mn")
+        return s.casefold()
+
+    def _active_enum_labels(self) -> list[str]:
+        """Return option labels for active field (enum/bool), else []."""
+        st = self.store.state
+        if st.mode != Mode.FIELD_EDITING or not st.editing:
+            return []
+        spec = self.registry.get_spec(st.editing.type_id)
+        seq = st.editing.field_sequence
+        if not (0 <= st.editing.index < len(seq)):
+            return []
+        fname = seq[st.editing.index]
+        fdef = spec.get("fields", {}).get(fname, {})
+        ftype = fdef.get("type", "enum")
+        if ftype == "bool":
+            return ["Yes", "No"]
+        if ftype == "enum":
+            return list(dict.fromkeys(fdef.get("map", {}).values()))
+        return []
+
+    def _restart_fieldbuf_timer(self):
+        if self._fieldbuf_timeout_ms > 0:
+            self._fieldbuf_timer.start(self._fieldbuf_timeout_ms)
+
+    def _on_fieldbuf_timeout(self):
+        if self._field_buffer:
+            self._field_buffer = ""
+            self._refresh_hud()
+
+    def _typeahead_try_commit(self):
+        """Disambiguate & commit if unique (or exact label), else wait."""
+        labels = self._active_enum_labels()
+        fb = self._field_buffer
+        if not labels:
+            self._refresh_hud(); return
+        if not fb:
+            self._refresh_hud(); return
+        F = self._fold
+        fbuf = F(fb)
+        exact = [L for L in labels if F(L) == fbuf]
+        if exact:
+            choice = exact[0]
+            self._commit_choice_and_flash(choice)
+            return
+        matches = [L for L in labels if F(L).startswith(fbuf)]
+        if len(matches) == 1:
+            self._commit_choice_and_flash(matches[0])
+        else:
+            # ambiguous or no match → wait for more chars (HUD will update)
+            self._refresh_hud()
+
+
+    def _handle_maybe_numeric_char(self, ch: str) -> bool:
+        """
+        If active field is int and `ch` is a digit, commit immediately and advance.
+        Returns True if the key was consumed.
+        """
+        st = self.store.state
+        if st.mode != Mode.FIELD_EDITING or not st.editing:
+            return False
+        if not ch or len(ch) != 1 or not ch.isdigit():
+            return False
+
+        spec = self.registry.get_spec(st.editing.type_id)
+        seq = st.editing.field_sequence
+        if not (0 <= st.editing.index < len(seq)):
+            return False
+        fname = seq[st.editing.index]
+        fdef = spec.get("fields", {}).get(fname, {})
+        if fdef.get("type", "enum") != "int":
+            return False
+
+        try:
+            self.store.apply(SetFieldValue(int(ch)))
+            self.store.apply(NextField())
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
+            self.toast(ch, ttl=0.15)
+            self._refresh_hud()
+            return True
+        except ValueError as e:
+            self.toast(str(e), ttl=1.5)
+            return True  # handled (don’t feed buffer)
+
+    def _handle_maybe_numeric_char(self, ch: str) -> bool:
+        """
+        Si le champ actif est de type 'int' et que `ch` est un chiffre,
+        on commit directement la valeur et on avance. Retourne True si consommé.
+        """
+        st = self.store.state
+        if st.mode != Mode.FIELD_EDITING or not st.editing:
+            return False
+        if not ch or len(ch) != 1 or not ch.isdigit():
+            return False
+
+        # Récupérer le schema du champ courant
+        spec = self.registry.get_spec(st.editing.type_id)
+        seq = st.editing.field_sequence
+        if not (0 <= st.editing.index < len(seq)):
+            return False
+        fname = seq[st.editing.index]
+        fdef = spec.get("fields", {}).get(fname, {})
+        ftype = fdef.get("type", "enum")
+        if ftype != "int":
+            return False
+
+        # Tente de fixer la valeur (le reducer re-valide via registry.validate_value)
+        try:
+            self.store.apply(SetFieldValue(int(ch)))
+            self.store.apply(NextField())
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
+            self.toast(ch, ttl=0.15)  # petit flash visuel
+            self._refresh_hud()
+            return True
+        except ValueError as e:
+            # chiffre hors plage/interdit → on ne consomme pas, laisse le flux normal
+            self.toast(str(e), ttl=1.5)
+            return True  # on a géré (affiché un toast), évite d'ajouter au buffer
+
+    def _commit_choice_and_flash(self, label: str):
+        """Commit label, flash briefly, then advance to next field."""
+        try:
+            self.store.apply(SetFieldValue(label))
+        except ValueError as e:
+            self.toast(str(e), ttl=2.0)
+            return
+        self._field_buffer = ""  # reset on commit
+        # brief flash
+        self.toast(label, ttl=0.2)
+        QtCore.QTimer.singleShot(120, self._advance_after_commit)
+
+    def _advance_after_commit(self):
+        try:
+            self.store.apply(NextField())
+        except ValueError as e:
+            self.toast(str(e), ttl=2.0)
+        self._refresh_hud()
 
     # ------------- Toasts -------------
 
@@ -491,6 +890,8 @@ class UIApp(QtWidgets.QMainWindow):
             name = f"S{number}"
             self.store.apply(NewSection(name=name, length=None))
             self._token_buffer = None
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
             self.toast(f"New section: {name}", ttl=1.2)
 
         elif kind == Action.TOKEN_APPEND:
@@ -506,7 +907,6 @@ class UIApp(QtWidgets.QMainWindow):
                 if not self._token_buffer:
                     self._token_buffer = None
 
-
         elif kind == Action.TOKEN_SUBMIT:
             tok = (self._token_buffer or "").strip()
             if not tok:
@@ -514,37 +914,60 @@ class UIApp(QtWidgets.QMainWindow):
             try:
                 self.store.apply(StartComponent(token=tok))
                 self._token_buffer = None
+                self._field_buffer = ""  # new draft → reset field buffer
+                self._fieldbuf_timer.stop()
             except ValueError:
                 self.toast(f"Unknown component '{tok}'", ttl=2.0)
 
         elif kind == Action.TOKEN_CLEAR:
             self._token_buffer = None
 
-        elif kind == Action.SET_FIELD_VALUE:
-            try:
-                self.store.apply(SetFieldValue(pay))
-            except ValueError as e:
-                self.toast(str(e), ttl=2.2)
+        elif kind == Action.FIELDBUF_APPEND:
+            ch = str(pay)
+            # Numeric one-tap commit
+            if self._handle_maybe_numeric_char(ch):
+                return
+            # Otherwise, type-ahead for enum/bool
+            self._field_buffer += ch
+            self._restart_fieldbuf_timer()
+            self._typeahead_try_commit()
+
+        elif kind == Action.FIELDBUF_BACKSPACE:
+            if self._field_buffer:
+                self._field_buffer = self._field_buffer[:-1]
+            self._restart_fieldbuf_timer()
+            self._typeahead_try_commit()
+
+        elif kind == Action.FIELDBUF_CLEAR:
+            if self._field_buffer:
+                self._field_buffer = ""
+                self._fieldbuf_timer.stop()
+                self._refresh_hud()
 
         elif kind == Action.NEXT_FIELD:
             try:
                 self.store.apply(NextField())
+                self._field_buffer = ""  # reset on advance
+                self._fieldbuf_timer.stop()
             except ValueError as e:
                 self.toast(str(e), ttl=2.0)
 
         elif kind == Action.PREV_FIELD:
             self.store.apply(PrevField())
+            self._field_buffer = ""  # reset on backtrack
+            self._fieldbuf_timer.stop()
 
         elif kind == Action.CANCEL_DRAFT:
             self.store.apply(CancelDraft())
             self.toast("Canceled draft", ttl=1.2)
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
 
         elif kind == Action.SAVE:
             self._on_save()
 
         elif kind == Action.NAV_PAGE:
             delta = int(pay)
-            # Update state then PdfIO (keep both in sync)
             self.store.apply(NavPage(delta))
             self.pdf.nav(delta)
             self.canvas.update()
@@ -552,21 +975,30 @@ class UIApp(QtWidgets.QMainWindow):
             total = max(1, self.store.state.pdf.page_count)
             self.toast(f"Page {page}/{total}", ttl=0.8)
 
+            # NEW
+            self._update_dimension_overlays()
+            self.canvas.update()
+
+
         elif kind == Action.SET_ZOOM:
             zoom = float(pay)
             self.store.apply(SetZoom(zoom))
             self.pdf.set_zoom(self.store.state.pdf.zoom)
-            self.canvas.update()
+            self.canvas.refit()
             self.toast(f"Zoom {int(self.store.state.pdf.zoom*100)}%", ttl=0.8)
 
         elif kind == Action.UNDO:
             self.store.undo()
+            self._field_buffer = ""  # state potentially different → clear
+            self._fieldbuf_timer.stop()
 
         elif kind == Action.REDO:
             self.store.redo()
+            self._field_buffer = ""
+            self._fieldbuf_timer.stop()
 
         elif kind == Action.PREV_SECTION:
-            from state import PrevSection  # local import if not already at top
+            from state import PrevSection  # lazy import
             self.store.apply(PrevSection())
             self.toast(f"Section S{self.store.state.get_active_section().number}", ttl=0.8)
 
@@ -575,6 +1007,9 @@ class UIApp(QtWidgets.QMainWindow):
             self.store.apply(NextSection())
             self.toast(f"Section S{self.store.state.get_active_section().number}", ttl=0.8)
 
+        # >>> NEW: advance to the next PDF in playlist (only fires when not editing)
+        elif kind == Action.NEXT_PDF:
+            self._next_pdf()
 
         self._refresh_hud()
 
@@ -582,7 +1017,7 @@ class UIApp(QtWidgets.QMainWindow):
 
     def _refresh_hud(self):
         msgs = [m for (m, t) in self._toasts if t > time.time()]
-        model = self.prompts.build(self.store.state, self._token_buffer, msgs)
+        model = self.prompts.build(self.store.state, self._token_buffer, msgs, field_buffer=self._field_buffer)
         self.hud.set_model(model)
         self.canvas.update()
 
@@ -594,16 +1029,11 @@ class UIApp(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        try:
-            self.pdf.open(path)
-            # Keep reducer authoritative for nav logic:
-            # We don't have a command for page_count; set directly (one-time side effect).
-            self.store.state.pdf.page_count = self.pdf.page_count  # noqa: direct state set (practical)
-            self.store.state.pdf.page = 0
-            self.canvas.update()
-            self.toast("PDF loaded", ttl=1.0)
-        except Exception as e:
-            self.toast(f"Failed to open PDF: {e}", ttl=2.5)
+        # Opening via dialog cancels any existing playlist and just opens this file
+        self._pdf_list = [path]
+        self._pdf_index = 0
+        self._load_pdf_path(path)
+        self.toast("PDF loaded", ttl=1.0)
 
 
 # -------------------------

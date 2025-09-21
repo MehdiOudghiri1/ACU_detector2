@@ -17,6 +17,11 @@ from state import (
 )
 from pdfio import PdfIO
 from dimension_extractor import analyze_page
+from types import SimpleNamespace
+from pathlib import Path
+
+
+
 
 
 # -------------------------
@@ -33,7 +38,7 @@ class Action:
     TOKEN_APPEND = "TOKEN_APPEND"
     TOKEN_SUBMIT = "TOKEN_SUBMIT"
     TOKEN_CLEAR = "TOKEN_CLEAR"
-    SET_FIELD_VALUE = "SET_FIELD_VALUE"
+    SET_FIELD_VALUE = "SET_FIELD_VALUE"  # kept for backward-compat (not used by type-ahead)
     NEXT_FIELD = "NEXT_FIELD"
     PREV_FIELD = "PREV_FIELD"
     CANCEL_DRAFT = "CANCEL_DRAFT"
@@ -53,100 +58,11 @@ class Action:
     FIELDBUF_CLEAR = "FIELDBUF_CLEAR"
     NEXT_PDF = "NEXT_PDF"
 
-    # Resets (standardized)
-    RESET_SECTION = "RESET_SECTION"     # Ctrl+R → reset active section (incl. length) and prompt length again
-    START_OVER = "START_OVER"           # Ctrl+Shift+R → clear all annotations for this PDF
-
-
-# -------------------------
-# KeyRouter (mode-aware)
-# -------------------------
-
-class KeyRouter:
-    """Translate raw key events into Actions, with global + mode-specific priority."""
-
-    def route(self, state, event: QtGui.QKeyEvent, token_active: bool) -> Action:
-        key = event.key()
-        mods = event.modifiers()
-        text = event.text() or ""
-
-        # --- Global shortcuts (always) ---
-        if mods & QtCore.Qt.ControlModifier:
-            # Reset section only: Ctrl+R
-            if key == QtCore.Qt.Key_R and not (mods & QtCore.Qt.ShiftModifier):
-                return Action(Action.RESET_SECTION)
-            # Start over (entire PDF): Ctrl+Shift+R
-            if key == QtCore.Qt.Key_R and (mods & QtCore.Qt.ShiftModifier):
-                return Action(Action.START_OVER)
-
-            if key in (QtCore.Qt.Key_O,):
-                return Action(Action.OPEN_PDF)
-            if key in (QtCore.Qt.Key_S,):
-                return Action(Action.SAVE)
-            if key in (QtCore.Qt.Key_P,):
-                return Action(Action.NAV_PAGE, -1)
-            if key in (QtCore.Qt.Key_N,):
-                return Action(Action.NAV_PAGE, +1)
-            if key in (QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal):
-                return Action(Action.SET_ZOOM, min(getattr(state, "pdf", None).zoom * 1.1 if state.pdf else 1.0 * 1.1, 4.0))
-            if key in (QtCore.Qt.Key_Minus,):
-                return Action(Action.SET_ZOOM, max(getattr(state, "pdf", None).zoom / 1.1 if state.pdf else 1.0 / 1.1, 0.25))
-            if key in (QtCore.Qt.Key_0,):
-                return Action(Action.SET_ZOOM, 1.0)
-            if key in (QtCore.Qt.Key_Z,):
-                return Action(Action.UNDO)
-            if key in (QtCore.Qt.Key_Y,):
-                return Action(Action.REDO)
-            if key == QtCore.Qt.Key_Up:
-                return Action(Action.PREV_SECTION)
-            if key == QtCore.Qt.Key_Down:
-                return Action(Action.NEXT_SECTION)
-
-        # --- Mode-specific: FIELD_EDITING ---
-        if state.mode == Mode.FIELD_EDITING:
-            if key == QtCore.Qt.Key_Tab and not (mods & QtCore.Qt.ShiftModifier):
-                return Action(Action.NEXT_FIELD)
-            if key == QtCore.Qt.Key_Backtab or (key == QtCore.Qt.Key_Tab and (mods & QtCore.Qt.ShiftModifier)):
-                return Action(Action.PREV_FIELD)
-            # Type-ahead editing behaviour
-            if key == QtCore.Qt.Key_Backspace:
-                return Action(Action.FIELDBUF_BACKSPACE)
-            if key == QtCore.Qt.Key_Escape:
-                return Action(Action.FIELDBUF_CLEAR)
-            # Character input for current field (passes to type-ahead / numeric handler in dispatcher)
-            if text and not (mods & QtCore.Qt.ControlModifier):
-                ch = text.strip()
-                if ch:
-                    return Action(Action.FIELDBUF_APPEND, ch)
-            return Action(Action.NOOP)
-
-        # --- Next PDF (plain 'n') ---
-        # Only when NOT editing a field and NOT typing a token
-        if key == QtCore.Qt.Key_N and not (mods & QtCore.Qt.ControlModifier) and not token_active:
-            return Action(Action.NEXT_PDF)
-
-        # --- SECTION_ACTIVE (and IDLE behaves the same for MVP) ---
-        if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            # If in token typing, submit token. Otherwise create new section.
-            if token_active:
-                return Action(Action.TOKEN_SUBMIT)
-            return Action(Action.NEW_SECTION)
-
-        if key == QtCore.Qt.Key_Escape and token_active:
-            return Action(Action.TOKEN_CLEAR)
-
-        # just before token typing section (and after FIELD_EDITING block)
-        if token_active and key == QtCore.Qt.Key_Backspace:
-            return Action(Action.TOKEN_BACKSPACE)
-
-        # Token typing: accept letters/digits/_-
-        if text and text.isprintable() and not (mods & QtCore.Qt.ControlModifier):
-            ch = text.strip()
-            if ch:
-                # Start or append token while in SECTION_ACTIVE
-                return Action(Action.TOKEN_APPEND, ch)
-
-        return Action(Action.NOOP)
+    # Resets
+    START_OVER = "START_OVER"           # Ctrl+Shift+R → reset all annotations for this PDF
+    RESET_SECTION = "RESET_SECTION"
+    RESET_ALL = "RESET_ALL"
+    PREV_PDF = "PREV_PDF"      # ⟵ add this
 
 
 # -------------------------
@@ -171,6 +87,8 @@ class HudModel:
     options_visual: List[Tuple[str, int]]  # (label, match_prefix_len) ; 0 if no match
     ambiguous: bool
     no_match: bool
+    # NEW: visual cue when section length not set
+    awaiting_length: bool
 
 
 class PromptBuilder:
@@ -265,7 +183,13 @@ class PromptBuilder:
         pc = max(1, state.pdf.page_count) if state.pdf else 1
         pg = (state.pdf.page + 1) if state.pdf else 1
         zoom = int((state.pdf.zoom if state.pdf else 1.0) * 100)
-        foot = f"Page {pg}/{pc}  •  Zoom {zoom}%  •  Ctrl+R reset section • Ctrl+Shift+R start over • Ctrl+O open"
+        foot = f"Page {pg}/{pc}  •  Zoom {zoom}%  •  Ctrl+O to open PDF"
+
+        # awaiting length?
+        awaiting_length = False
+        if state.sections and state.active_section_id:
+            sec = state.get_active_section()
+            awaiting_length = (sec is not None and sec.length is None)
 
         return HudModel(
             title=title,
@@ -277,6 +201,7 @@ class PromptBuilder:
             options_visual=options_visual,
             ambiguous=ambiguous,
             no_match=no_match,
+            awaiting_length=awaiting_length,
         )
 
 
@@ -293,6 +218,8 @@ class HUDOverlay(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_NoSystemBackground)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self._model: Optional[HudModel] = None
+        # UI scale: +15% for the HUD and toasts
+        self._scale = 1.15
 
     def set_model(self, model: HudModel):
         self._model = model
@@ -304,21 +231,29 @@ class HUDOverlay(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.TextAntialiasing)
 
+        S = self._scale
+
         # Panel rect (bottom-center)
         margin = 16
-        panel_w = min(self.width() - 2*margin, 980)
-        panel_h = 150 if (self._model.fields or self._model.token_ui) else 100
+        panel_w = min(self.width() - 2*margin, int(980 * S))  # widen slightly with scale
+        base_h = 150 if (self._model.fields or self._model.token_ui) else 100
+        panel_h = int(base_h * S)
         x = (self.width() - panel_w) // 2
-        y = self.height() - panel_h - 24
+        y = self.height() - panel_h - int(24 * S)
 
-        # Background
+        # Background (light green if awaiting length)
         panel_rect = QtCore.QRectF(x, y, panel_w, panel_h)
-        p.setBrush(QtGui.QColor(20, 20, 24, 190))
+        if self._model.awaiting_length:
+            # light green glass
+            bg = QtGui.QColor(30, 90, 200, 180)
+        else:
+            bg = QtGui.QColor(20, 20, 24, 190)
+        p.setBrush(bg)
         p.setPen(QtCore.Qt.NoPen)
         p.drawRoundedRect(panel_rect, 10, 10)
 
         # Text metrics
-        pad = 14
+        pad = int(14 * S)
         text_x = x + pad
         cur_y = y + pad
 
@@ -326,62 +261,62 @@ class HUDOverlay(QtWidgets.QWidget):
         title = self._model.title
         p.setPen(QtGui.QColor(240, 240, 240))
         font = p.font()
-        font.setPointSizeF(11.5)
+        font.setPointSizeF(11.5 * S)
         font.setBold(True)
         p.setFont(font)
-        p.drawText(QtCore.QPointF(text_x, cur_y + 18), title)
-        cur_y += 26
+        p.drawText(QtCore.QPointF(text_x, cur_y + int(18 * S)), title)
+        cur_y += int(26 * S)
 
         # Fields line
         if self._model.fields:
             font.setBold(False)
-            font.setPointSizeF(10.5)
+            font.setPointSizeF(10.5 * S)
             p.setFont(font)
             seg_x = text_x
             for chip in self._model.fields:
                 label = f"{chip.name} = {chip.value}"
-                rect = QtCore.QRectF(seg_x, cur_y, p.fontMetrics().horizontalAdvance(label) + 16, 24)
+                rect = QtCore.QRectF(seg_x, cur_y, p.fontMetrics().horizontalAdvance(label) + int(16 * S), int(24 * S))
                 # chip bg
-                bg = QtGui.QColor(60, 60, 70, 230) if not chip.active else QtGui.QColor(90, 110, 170, 230)
-                p.setBrush(bg)
+                bg_chip = QtGui.QColor(60, 60, 70, 230) if not chip.active else QtGui.QColor(90, 110, 170, 230)
+                p.setBrush(bg_chip)
                 p.setPen(QtCore.Qt.NoPen)
                 p.drawRoundedRect(rect, 6, 6)
                 # chip text
                 p.setPen(QtGui.QColor(240, 240, 240))
-                p.drawText(QtCore.QPointF(rect.x() + 8, rect.y() + 17), label)
-                seg_x += rect.width() + 8
-            cur_y += 32
+                p.drawText(QtCore.QPointF(rect.x() + int(8 * S), rect.y() + int(17 * S)), label)
+                seg_x += rect.width() + int(8 * S)
+            cur_y += int(32 * S)
 
         # Hints
         if self._model.hints:
             hints = " • ".join(self._model.hints)
             p.setPen(QtGui.QColor(200, 200, 210))
-            font.setPointSizeF(10)
+            font.setPointSizeF(10 * S)
             p.setFont(font)
-            p.drawText(QtCore.QPointF(text_x, cur_y + 18), f"Hints: {hints}")
-            cur_y += 24
+            p.drawText(QtCore.QPointF(text_x, cur_y + int(18 * S)), f"Hints: {hints}")
+            cur_y += int(24 * S)
 
         # Options visual line (labels with prefix underlined/bold)
         if self._model.options_visual:
             font = p.font()
-            font.setPointSizeF(10.5)
+            font.setPointSizeF(10.5 * S)
             p.setFont(font)
             seg_x = text_x
-            gap = 16
+            gap = int(16 * S)
             for label, pref_len in self._model.options_visual:
                 # split prefix/rest
                 prefix = label[:pref_len]
                 rest = label[pref_len:]
                 # draw pill
-                lab_w = p.fontMetrics().horizontalAdvance(label) + 20
-                rect = QtCore.QRectF(seg_x, cur_y, lab_w, 26)
+                lab_w = p.fontMetrics().horizontalAdvance(label) + int(20 * S)
+                rect = QtCore.QRectF(seg_x, cur_y, lab_w, int(26 * S))
                 bg = QtGui.QColor(55, 55, 65, 210)
                 p.setBrush(bg)
                 p.setPen(QtCore.Qt.NoPen)
                 p.drawRoundedRect(rect, 6, 6)
                 # text
-                x0 = rect.x() + 10
-                y0 = rect.y() + 18
+                x0 = rect.x() + int(10 * S)
+                y0 = rect.y() + int(18 * S)
                 pen_norm = QtGui.QPen(QtGui.QColor(235, 235, 240))
                 pen_emph = QtGui.QPen(QtGui.QColor(255, 255, 255))
                 # prefix bold/underline
@@ -398,36 +333,40 @@ class HUDOverlay(QtWidgets.QWidget):
                     p.setPen(pen_norm)
                     p.drawText(QtCore.QPointF(x0, y0), label)
                 seg_x += rect.width() + gap
-            cur_y += 32
+            cur_y += int(32 * S)
 
         # Token line
         if self._model.token_ui:
             p.setPen(QtGui.QColor(220, 220, 230))
             mono = QtGui.QFont("Monospace")
             mono.setStyleHint(QtGui.QFont.TypeWriter)
-            mono.setPointSizeF(10)
+            mono.setPointSizeF(10 * S)
             p.setFont(mono)
-            p.drawText(QtCore.QPointF(text_x, cur_y + 18), self._model.token_ui)
+            p.drawText(QtCore.QPointF(text_x, cur_y + int(18 * S)), self._model.token_ui)
 
         # Footer (page/zoom)
         p.setPen(QtGui.QColor(180, 180, 190))
-        font.setPointSizeF(9.5)
+        font.setPointSizeF(9.5 * S)
         font.setBold(False)
         p.setFont(font)
-        p.drawText(QtCore.QPointF(x + pad, y + panel_h - 10), self._model.foot)
+        p.drawText(QtCore.QPointF(x + pad, y + panel_h - int(10 * S)), self._model.foot)
 
-        # Toasts (top-right)
-        tx = self.width() - 16
-        ty = 16
+        # Toasts (top-right) — 15% larger
+        tx = self.width() - int(16 * S)
+        ty = int(16 * S)
+        toast_h = int(30 * S)
+        font_toast = QtGui.QFont(p.font())
+        font_toast.setPointSizeF(10.5 * S)
         for msg in self._model.toasts:
-            rect = QtCore.QRectF(0, 0, min(380, self.width() - 32), 30)
+            rect = QtCore.QRectF(0, 0, min(int(380 * S), self.width() - int(32 * S)), toast_h)
             rect.moveTopRight(QtCore.QPointF(tx, ty))
-            p.setBrush(QtGui.QColor(30, 120, 60, 220))
+            p.setBrush(QtGui.QColor(30, 120, 60, 220))   # blue
             p.setPen(QtCore.Qt.NoPen)
             p.drawRoundedRect(rect, 8, 8)
             p.setPen(QtGui.QColor(250, 250, 250))
-            p.drawText(QtCore.QPointF(rect.x() + 10, rect.y() + 20), msg)
-            ty += rect.height() + 8
+            p.setFont(font_toast)
+            p.drawText(QtCore.QPointF(rect.x() + int(10 * S), rect.y() + int(20 * S)), msg)
+            ty += rect.height() + int(8 * S)
 
 
 # -------------------------
@@ -525,6 +464,120 @@ class PdfCanvas(QtWidgets.QWidget):
 # UIApp (controller)
 # -------------------------
 
+# -------------------------
+# KeyRouter (mode-aware)
+# -------------------------
+
+class KeyRouter:
+    """Translate raw key events into Actions, with global + mode-specific priority."""
+
+    def route(self, state, event: QtGui.QKeyEvent, token_active: bool) -> Action:
+        key = event.key()
+        mods = event.modifiers()
+        text = event.text() or ""
+
+        # --- Global shortcuts (always) ---
+        # inside KeyRouter.route, under "Global shortcuts"
+        if mods & QtCore.Qt.ControlModifier:
+            # Full restart: Ctrl+R
+            if key == QtCore.Qt.Key_R and not (mods & QtCore.Qt.ShiftModifier):
+                return Action(Action.START_OVER)
+            # Section-only reset: Ctrl+Shift+R
+            if (mods & QtCore.Qt.ShiftModifier) and key == QtCore.Qt.Key_R:
+                return Action(Action.RESET_SECTION)
+
+                # (If you ever add Ctrl+R variations, handle them here.)
+            if key in (QtCore.Qt.Key_O,):
+                return Action(Action.OPEN_PDF)
+            if key in (QtCore.Qt.Key_S,):
+                return Action(Action.SAVE)
+            if key in (QtCore.Qt.Key_P,):
+                return Action(Action.NAV_PAGE, -1)
+            if key in (QtCore.Qt.Key_N,):
+                return Action(Action.NAV_PAGE, +1)
+            # Zoom in aliases: Ctrl + (+) OR (=) OR Up Arrow OR ]
+            if key in (
+                QtCore.Qt.Key_Plus,
+                QtCore.Qt.Key_Equal,
+                QtCore.Qt.Key_Up,
+                QtCore.Qt.Key_BracketRight,
+            ):
+                cur = state.pdf.zoom if state.pdf else 1.0
+                return Action(Action.SET_ZOOM, min(cur * 1.1, 4.0))
+
+            # Zoom out aliases: Ctrl + (-) OR Down Arrow OR [
+            if key in (
+                QtCore.Qt.Key_Minus,
+                QtCore.Qt.Key_Down,
+                QtCore.Qt.Key_BracketLeft,
+            ):
+                cur = state.pdf.zoom if state.pdf else 1.0
+                return Action(Action.SET_ZOOM, max(cur / 1.1, 0.25))
+
+            # Reset to 100%
+            if key in (QtCore.Qt.Key_0,):
+                return Action(Action.SET_ZOOM, 1.0)
+
+            if key in (QtCore.Qt.Key_Z,):
+                return Action(Action.UNDO)
+            if key in (QtCore.Qt.Key_Y,):
+                return Action(Action.REDO)
+            if key == QtCore.Qt.Key_Up:
+                return Action(Action.PREV_SECTION)
+            if key == QtCore.Qt.Key_Down:
+                return Action(Action.NEXT_SECTION)
+
+        # --- Mode-specific: FIELD_EDITING ---
+        if state.mode == Mode.FIELD_EDITING:
+            if key == QtCore.Qt.Key_Tab and not (mods & QtCore.Qt.ShiftModifier):
+                return Action(Action.NEXT_FIELD)
+            if key == QtCore.Qt.Key_Backtab or (key == QtCore.Qt.Key_Tab and (mods & QtCore.Qt.ShiftModifier)):
+                return Action(Action.PREV_FIELD)
+            # Type-ahead editing behaviour
+            if key == QtCore.Qt.Key_Backspace:
+                return Action(Action.FIELDBUF_BACKSPACE)
+            if key == QtCore.Qt.Key_Escape:
+                return Action(Action.FIELDBUF_CLEAR)
+            # Character input for current field (passes to type-ahead / numeric handler in dispatcher)
+            if text and not (mods & QtCore.Qt.ControlModifier):
+                ch = text.strip()
+                if ch:
+                    return Action(Action.FIELDBUF_APPEND, ch)
+            return Action(Action.NOOP)
+
+
+        if key == QtCore.Qt.Key_P and not (mods & QtCore.Qt.ControlModifier) and not token_active:
+            return Action(Action.PREV_PDF)
+
+        # --- Next PDF (plain 'n') ---
+        # Only when NOT editing a field and NOT typing a token
+        if key == QtCore.Qt.Key_N and not (mods & QtCore.Qt.ControlModifier) and not token_active:
+            return Action(Action.NEXT_PDF)
+
+        # --- SECTION_ACTIVE (and IDLE behaves the same for MVP) ---
+        if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            # If in token typing, submit token. Otherwise create new section.
+            if token_active:
+                return Action(Action.TOKEN_SUBMIT)
+            return Action(Action.NEW_SECTION)
+
+        if key == QtCore.Qt.Key_Escape and token_active:
+            return Action(Action.TOKEN_CLEAR)
+
+        # just before token typing section (and after FIELD_EDITING block)
+        if token_active and key == QtCore.Qt.Key_Backspace:
+            return Action(Action.TOKEN_BACKSPACE)
+
+        # Token typing: accept letters/digits/_-
+        if text and text.isprintable() and not (mods & QtCore.Qt.ControlModifier):
+            ch = text.strip()
+            if ch:
+                # Start or append token while in SECTION_ACTIVE
+                return Action(Action.TOKEN_APPEND, ch)
+
+        return Action(Action.NOOP)
+
+
 class UIApp(QtWidgets.QMainWindow):
     """Main window: owns Store/Registry/PdfIO, handles keys, updates Canvas + HUD."""
 
@@ -552,7 +605,6 @@ class UIApp(QtWidgets.QMainWindow):
         self._on_save = on_save or self._default_save
 
         # --- Type-ahead field buffer ---
-        this = self
         self._field_buffer: str = ""
         self._fieldbuf_timeout_ms = 4000  # configurable: 4s
         self._fieldbuf_timer = QtCore.QTimer(self)
@@ -567,6 +619,30 @@ class UIApp(QtWidgets.QMainWindow):
 
         # Keep latest analysis (optional)
         self._last_analysis = None
+        # --- Inline Indoor/Outdoor chooser ---
+        self._io_choice_active: bool = False
+        self._io_current: str = "Indoor"        # default preselection
+        self._io_after_new_section: bool = False
+
+        # --- Tiny header showing current PDF name + page ---
+        self._titlebar = QtWidgets.QToolBar(self)
+        self._titlebar.setMovable(False)
+        self._titlebar.setFloatable(False)
+        self._titlebar.setIconSize(QtCore.QSize(16, 16))
+        self._titlebar.setFixedHeight(26)  # small strip
+        self._titlebar.setStyleSheet("QToolBar{background: #f5f5f8; border: none;}")
+
+        self._title_label = QtWidgets.QLabel("— no PDF —")
+        self._title_label.setStyleSheet("color:#555; font-size:11px;")
+        self._title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+        self._titlebar.addWidget(self._title_label)
+        self._titlebar.addWidget(spacer)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, self._titlebar)
+
 
         # Central layout: PDF canvas + HUD overlay on top
         central = QtWidgets.QWidget(self)
@@ -592,13 +668,16 @@ class UIApp(QtWidgets.QMainWindow):
         act_open.setShortcut("Ctrl+O")
         act_open.triggered.connect(self._open_pdf_dialog)
 
+        # Start Over (this PDF) → now Ctrl+R
+        act_start_over = m_file.addAction("Start Over (This PDF)")
+        act_start_over.setShortcut("Ctrl+R")
+        act_start_over.triggered.connect(lambda: self._dispatch(Action(Action.START_OVER)))
+
+        # Reset Section → now Ctrl+Shift+R
         act_reset_section = m_file.addAction("Reset Section")
-        act_reset_section.setShortcut("Ctrl+R")
+        act_reset_section.setShortcut("Ctrl+Shift+R")
         act_reset_section.triggered.connect(lambda: self._dispatch(Action(Action.RESET_SECTION)))
 
-        act_start_over = m_file.addAction("Start Over (This PDF)")
-        act_start_over.setShortcut("Ctrl+Shift+R")
-        act_start_over.triggered.connect(lambda: self._dispatch(Action(Action.START_OVER)))
 
         # Initial HUD + nice default sizing
         self._refresh_hud()
@@ -608,6 +687,36 @@ class UIApp(QtWidgets.QMainWindow):
         h = int(geometry.height() * 0.8)
         self.resize(w, h)
         self.move((geometry.width() - w) // 2, (geometry.height() - h) // 2)
+    
+    def _ensure_meta(self):
+        st = self.store.state
+        if not hasattr(st, "meta") or st.meta is None:
+            st.meta = SimpleNamespace(indoor_outdoor=None)
+        elif not hasattr(st.meta, "indoor_outdoor"):
+            st.meta.indoor_outdoor = None
+
+
+    # add near other helpers in UIApp
+    def _apply_dimensions_to_meta(self, analysis):
+        """Copy detected dimensions into state.meta so Exporter picks them up."""
+        from types import SimpleNamespace
+        st = self.store.state
+        meta = getattr(st, "meta", None) or SimpleNamespace()
+
+        def grab(kind: str):
+            dims = getattr(analysis, "dimensions", None) or []
+            for d in dims:
+                if getattr(d, "kind", None) == kind and getattr(d, "value", None) is not None:
+                    return d.value
+            return None
+
+        # Map detector kinds → export/meta attribute names
+        setattr(meta, "width_with_base",  grab("width_with_base"))
+        setattr(meta, "base_height",      grab("height_base_only"))   # Exporter expects "Height (base only)" ← base_height
+        setattr(meta, "cabinet_height",   grab("cabinet_height"))
+        setattr(meta, "cabinet_width",    grab("cabinet_width"))
+
+        st.meta = meta
 
     def load_pdf_list(self, paths: list[str]):
         """Set a list of PDFs to process; open the first."""
@@ -636,6 +745,17 @@ class UIApp(QtWidgets.QMainWindow):
         self._load_pdf_path(self._pdf_list[self._pdf_index])
         self.toast(f"PDF {self._pdf_index + 1}/{len(self._pdf_list)}", ttl=0.8)
 
+    def _update_header(self):
+        path = getattr(self.store.state.pdf, "path", None)
+        if path:
+            name = Path(path).name
+            pg = (self.store.state.pdf.page + 1) if self.store.state.pdf else 1
+            pc = max(1, self.store.state.pdf.page_count) if self.store.state.pdf else 1
+            self._title_label.setText(f"{name}  ·  Page {pg}/{pc}")
+        else:
+            self._title_label.setText("— no PDF —")
+
+
     def _next_pdf(self):
         """Public handler for NEXT_PDF action."""
         if not self._pdf_list:
@@ -654,12 +774,43 @@ class UIApp(QtWidgets.QMainWindow):
 
         self._open_next_pdf(initial=False)
 
+    def _prev_pdf(self):
+        if not self._pdf_list:
+            self.toast("No folder playlist loaded", ttl=1.5)
+            return
+        if self.store.state.mode == Mode.FIELD_EDITING:
+            # Ignore 'p' while editing a field
+            return
+
+        # Let app.py stage current JSON before switching (same hook as next)
+        if callable(getattr(self, "_on_before_next_pdf", None)):
+            try:
+                self._on_before_next_pdf()
+            except Exception as e:
+                self.toast(f"Stage failed: {e}", ttl=2.0)
+
+        if self._pdf_index <= 0:
+            self._pdf_index = 0
+            self.toast("At first PDF", ttl=1.2)
+            return
+
+        self._pdf_index -= 1
+        self._load_pdf_path(self._pdf_list[self._pdf_index])
+        self.toast(f"PDF {self._pdf_index + 1}/{len(self._pdf_list)}", ttl=0.8)
+
+
     def _load_pdf_path(self, path: str):
         """Open a specific PDF and reset app state for a fresh annotation session."""
         try:
             self.pdf.open(path)
             # Reset reducer/store for a fresh document
             self.store = Store(registry=self.registry)
+            self._ensure_meta()
+            self._io_choice_active: bool = False
+            self._io_current: str = "Indoor"  # default cursor
+            if getattr(self.store.state.meta, "indoor_outdoor", None) is None:
+                self._io_choice_active = True
+
             # Keep reducer authoritative for nav logic but set essentials:
             self.store.state.pdf.path = path              # ⟵ ensure Exporter.filename() picks the right folder
             self.store.state.pdf.page_count = self.pdf.page_count
@@ -686,6 +837,8 @@ class UIApp(QtWidgets.QMainWindow):
             )
 
             self._last_analysis = analysis
+            self._apply_dimensions_to_meta(analysis)
+
 
             rects_pt = [d.bbox_pt for d in (analysis.dimensions or [])]
             kinds    = [d.kind    for d in (analysis.dimensions or [])]
@@ -693,9 +846,13 @@ class UIApp(QtWidgets.QMainWindow):
                 self.canvas.set_dimension_rects(rects_pt, kinds)
 
             self.canvas.update()
+            self._update_header()
+
 
         except Exception as e:
             self.toast(f"Failed to open PDF: {e}", ttl=2.5)
+
+
 
     def _update_dimension_overlays(self):
         """Analyze the current page and paint dimension boxes on the canvas."""
@@ -712,12 +869,26 @@ class UIApp(QtWidgets.QMainWindow):
                 dpi=150,
             )
 
+            self._apply_dimensions_to_meta(analysis)
+            self._last_analysis = analysis
+
+
             rects_pt = [d.bbox_pt for d in analysis.dimensions]
             kinds    = [d.kind    for d in analysis.dimensions]
             self.canvas.set_dimension_rects(rects_pt, kinds)
         except Exception as e:
             self.canvas.set_dimension_rects([])
             self.toast(f"Analyzer: {e}", ttl=2.0)
+
+    def _set_indoor_outdoor(self, value: str):
+        from types import SimpleNamespace
+        st = self.store.state
+        meta = getattr(st, "meta", None) or SimpleNamespace()
+        meta.indoor_outdoor = value  # "Indoor" | "Outdoor"
+        st.meta = meta
+        st.dirty = True
+        self.toast(f"Unit location: {value}", ttl=1.2)
+
 
     # ---------- Type-ahead helpers ----------
     @staticmethod
@@ -853,6 +1024,38 @@ class UIApp(QtWidgets.QMainWindow):
         self.hud.setGeometry(self.centralWidget().geometry())
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        # --- Inline Indoor/Outdoor chooser (shown at startup before any sections) ---
+        if self._io_choice_active:
+            key = event.key()
+            text = (event.text() or "").lower()
+
+            # Toggle with arrows or I/O keys
+            if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Tab) or text in ("i", "o"):
+                if text == "i":
+                    self._io_current = "Indoor"
+                elif text == "o":
+                    self._io_current = "Outdoor"
+                else:
+                    # flip on arrows/tab
+                    self._io_current = "Outdoor" if self._io_current == "Indoor" else "Indoor"
+                self._refresh_hud()
+                event.accept()
+                return
+
+            # Confirm with Enter
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                self._ensure_meta()
+                self.store.state.meta.indoor_outdoor = self._io_current
+                self._io_choice_active = False
+                self.toast(f"Installation: {self._io_current}", ttl=1.2)
+                self._refresh_hud()
+                event.accept()
+                return
+
+            # (Optional) Escape: do nothing—force the user to choose first
+            event.accept()
+            return
+
         # --- Inline Section Length Mode (captures keys before router) ---
         if self._length_input_active:
             key = event.key()
@@ -902,7 +1105,7 @@ class UIApp(QtWidgets.QMainWindow):
             event.accept()
             return
 
-        # --- normal flow if not in length mode ---
+        # --- normal flow if not in any inline mode ---
         try:
             action = self.router.route(self.store.state, event, token_active=self._token_buffer is not None)
             self._dispatch(action)
@@ -925,19 +1128,36 @@ class UIApp(QtWidgets.QMainWindow):
             return
 
         if kind == Action.NEW_SECTION:
-            # Autoname S{n+1}. Length left None for now.
+            # Require Indoor/Outdoor before the very first section
+            if (
+                not self.store.state.sections
+                and not getattr(getattr(self.store.state, "meta", None), "indoor_outdoor", None)
+            ):
+                # Pop the inline chooser; we'll resume NEW_SECTION after the user confirms
+                self._io_choice_active = True
+                self._io_current = "Indoor"      # default preselection
+                self._io_after_new_section = True
+                self._refresh_hud()
+                return
+
+            # Create the section now
             number = (self.store.state.sections[-1].number + 1) if self.store.state.sections else 1
             name = f"S{number}"
             self.store.apply(NewSection(name=name, length=None))
+
+            # Clear transient buffers
             self._token_buffer = None
             self._field_buffer = ""
             self._fieldbuf_timer.stop()
+
             self.toast(f"New section: {name}", ttl=1.2)
 
-            # Start inline length entry (HUD-driven)
+            # Immediately prompt for Section Length (inline HUD)
             self._length_input_active = True
             self._length_buffer = ""
             self._refresh_hud()
+            return
+
 
         elif kind == Action.TOKEN_APPEND:
             ch = str(pay)
@@ -1023,13 +1243,16 @@ class UIApp(QtWidgets.QMainWindow):
             # Update overlays
             self._update_dimension_overlays()
             self.canvas.update()
+            self._update_header()
+
 
         elif kind == Action.SET_ZOOM:
             zoom = float(pay)
             self.store.apply(SetZoom(zoom))
-            self.pdf.set_zoom(self.store.state.pdf.zoom)
-            self.canvas.refit()
+            self.pdf.set_zoom(self.store.state.pdf.zoom)  # keep manual zoom
+            self.canvas.update()                          # repaint only (no fit_to_frame)
             self.toast(f"Zoom {int(self.store.state.pdf.zoom*100)}%", ttl=0.8)
+
 
         elif kind == Action.UNDO:
             self.store.undo()
@@ -1054,33 +1277,25 @@ class UIApp(QtWidgets.QMainWindow):
         # >>> advance to the next PDF in playlist (only fires when not editing)
         elif kind == Action.NEXT_PDF:
             self._next_pdf()
+        elif kind == Action.PREV_PDF:
+            self._prev_pdf()
 
-        # --- Reset active section (Ctrl+R): clears components AND length, then re-prompt length ---
+        # --- Reset active section (Ctrl+R) ---
         elif kind == Action.RESET_SECTION:
             sec = self.store.state.get_active_section()
             if not sec:
                 self.toast("No active section", ttl=1.5); self._refresh_hud(); return
             ans = QtWidgets.QMessageBox.question(
                 self, "Reset Section",
-                f"Clear Section S{sec.number} (components and length)?",
+                f"Clear all components in Section S{sec.number}? (Length will be kept)",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
             )
             if ans != QtWidgets.QMessageBox.Yes:
                 self._refresh_hud(); return
+            from state import ResetSection
             try:
-                # Reducer version with no args:
-                self.store.apply(ResetSection())
-                # Immediately re-prompt for length
-                self._token_buffer = None
-                self._field_buffer = ""
-                self._fieldbuf_timer.stop()
-                self._length_input_active = True
-                self._length_buffer = ""
-                sec2 = self.store.state.get_active_section()
-                if sec2:
-                    self.toast(f"Section S{sec2.number} reset — enter length", ttl=1.4)
-                else:
-                    self.toast("Section reset — enter length", ttl=1.4)
+                self.store.apply(ResetSection(section_id=sec.id, clear_length=False))
+                self.toast(f"Section S{sec.number} cleared", ttl=1.2)
             except Exception as e:
                 self.toast(str(e), ttl=2.0)
 
@@ -1088,30 +1303,41 @@ class UIApp(QtWidgets.QMainWindow):
         elif kind == Action.START_OVER:
             if not self.store.state.pdf.path:
                 self.toast("No PDF loaded", ttl=1.5); self._refresh_hud(); return
+
             ans = QtWidgets.QMessageBox.question(
                 self, "Start Over",
-                "This will clear ALL sections/components for this PDF.\nContinue?",
+                "This will clear ALL sections/components for this PDF and restart from the beginning.\nContinue?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
             )
             if ans != QtWidgets.QMessageBox.Yes:
                 self._refresh_hud(); return
+
             path = self.store.state.pdf.path
             page = self.store.state.pdf.page
-            # Fresh store but preserve current PDF context
+
+            # Fresh store (wipes sections, lengths, meta—including Indoor/Outdoor)
             self.store = Store(registry=self.registry)
             self.store.state.pdf.path = path
             self.store.state.pdf.page_count = self.pdf.page_count
             self.store.state.pdf.page = page
+
             # Clear transient UI buffers
             self._token_buffer = None
             self._field_buffer = ""
-            self._fieldbuf_timer.stop()
             self._length_input_active = False
             self._length_buffer = ""
-            # Re-render & overlays
+
+            # 🔹 Re-show the Indoor/Outdoor inline chooser
+            self._io_choice_active = True
+            self._io_current = "Indoor"  # default highlight
+
+            # UI refresh
             self.canvas.refit()
             self._update_dimension_overlays()
-            self.toast("Cleared annotations for this PDF", ttl=1.2)
+            self.toast("Project reset — choose Indoor/Outdoor to begin", ttl=1.6)
+            self._refresh_hud()
+            return
+
 
         self._refresh_hud()
 
@@ -1129,6 +1355,24 @@ class UIApp(QtWidgets.QMainWindow):
             model.hints = ["Type digits • Backspace to edit • Enter to confirm • Esc to skip"]
             disp = self._length_buffer if self._length_buffer else ""
             model.token_ui = f"length: {disp}▎"
+
+        # Inline Indoor/Outdoor chooser HUD
+        if self._io_choice_active:
+            model.title = "Select unit location"
+            model.hints = ["Press I for Indoor • O for Outdoor • Enter to confirm"]
+            model.token_ui = f"Indoor/Outdoor: [{self._io_current}] ▎"
+
+        # Inline Indoor/Outdoor HUD overlay
+        if self._io_choice_active:
+            model.title = "Select installation type"
+            model.hints = ["Use ←/→ or I / O to switch • Enter to confirm"]
+            model.fields = []  # no chips while choosing
+            model.token_ui = f"installation: {self._io_current} ▎"
+            # Visually highlight the current choice using the pill row
+            model.options_visual = [
+                ("Indoor", len("Indoor") if self._io_current == "Indoor" else 0),
+                ("Outdoor", len("Outdoor") if self._io_current == "Outdoor" else 0),
+            ]
 
         self.hud.set_model(model)
         self.canvas.update()
@@ -1156,7 +1400,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     win = UIApp()
     win.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec())    
 
 
 if __name__ == "__main__":

@@ -87,7 +87,7 @@ class PrevSection(Command):
 class NextSection(Command): 
     """Go to next section (if any)."""
 
+@dataclass(frozen=True)
 class ResetSection(Command):
-    """Clear components of a section; optionally clear its length too."""
-    section_id: str
-    clear_length: bool = False
+    section_id: Optional[str] = None   # None ⇒ active section
+    clear_length: bool = True          # True ⇒ also reset the section length
